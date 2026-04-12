@@ -145,20 +145,27 @@ export function useAirQualityReminder(
 
   const setReminder = useCallback(
     async (lat: number, lon: number, categoryIndex: number) => {
+      if (categoryIndex < 1 || categoryIndex > 5) {
+        throw new Error('Invalid reminder threshold');
+      }
+
       const ok = await requestNotifyPermission();
       if (!ok) return;
-
-      try {
-        await writeAlertToSupabase(lat, lon, categoryIndex);
-      } catch (e) {
-        console.error('SAVE FAILED:', e);
-        throw e;
-      }
 
       const next: AirQualityReminder = { lat, lon, categoryIndex };
       setReminderState(next);
       await persist(next);
       thresholdCrossRef.current = null;
+
+      try {
+        await writeAlertToSupabase(lat, lon, categoryIndex);
+      } catch (e) {
+        console.error('SAVE FAILED:', e);
+        setReminderState(null);
+        await persist(null);
+        thresholdCrossRef.current = null;
+        throw e;
+      }
     },
     [persist],
   );

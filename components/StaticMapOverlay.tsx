@@ -12,14 +12,14 @@ import Svg, {
   Circle,
   Defs,
   G,
+  Path,
   Polyline,
   Polygon,
   RadialGradient,
   Stop,
-  Text as SvgText,
 } from 'react-native-svg';
 
-import { KRIGING_HEATMAP_GRID } from '../lib/krigingHeatmapPoints';
+import { KRIGING_SPLAT_DENSITY_HINT } from '../lib/krigingHeatmapPoints';
 
 import type { GeoBounds } from '../lib/geoPixel';
 import { latLonToPixel, pixelToLatLon } from '../lib/geoPixel';
@@ -27,6 +27,10 @@ import { getColorFromAqi, type MetricColorFn } from '../lib/metricColor';
 
 /** Max zoom = fit-to-view scale × this factor (keeps zoom modest). */
 const MAX_ZOOM_FACTOR = 2.25;
+
+/** Material-style notification bell, 24×24 viewBox — solid fill, no plate behind (map shows through). */
+const REMINDER_BELL_PATH =
+  'M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6V11c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z';
 
 /** Map-content pixels: taps within this distance of the reminder pin snap to that lat/lon. */
 const DEFAULT_REMINDER_SNAP_RADIUS_PX = 34;
@@ -153,7 +157,10 @@ export function StaticMapOverlay({
   }, [vw, vh, cw, ch]);
 
   const resolved = useMemo(() => {
-    const defaultSplatR = Math.max(14, (Math.min(cw, ch) / KRIGING_HEATMAP_GRID) * 1.85);
+    const heatmapCount = points.filter((p) => p.heatmapSplat).length;
+    const gridApprox =
+      heatmapCount > 0 ? Math.max(16, Math.ceil(Math.sqrt(heatmapCount))) : KRIGING_SPLAT_DENSITY_HINT;
+    const defaultSplatR = Math.max(14, (Math.min(cw, ch) / gridApprox) * 1.85);
 
     const pixelPts = points.map((p) => {
       const { x, y } = latLonToPixel(p.lat, p.lon, bounds, cw, ch);
@@ -321,8 +328,8 @@ export function StaticMapOverlay({
                       fy="50%"
                       gradientUnits="objectBoundingBox"
                     >
-                      <Stop offset="0%" stopColor={c} stopOpacity={0.16} />
-                      <Stop offset="45%" stopColor={c} stopOpacity={0.05} />
+                      <Stop offset="0%" stopColor={c} stopOpacity={0.12} />
+                      <Stop offset="45%" stopColor={c} stopOpacity={0.035} />
                       <Stop offset="100%" stopColor={c} stopOpacity={0} />
                     </RadialGradient>
                   ))}
@@ -346,7 +353,7 @@ export function StaticMapOverlay({
                     cy={p.y}
                     r={p.r}
                     fill={`url(#${heatmapGradientId(p.fill)})`}
-                    fillOpacity={p.opacity ?? 1}
+                    fillOpacity={Math.min(1, (p.opacity ?? 1) * 0.72)}
                   />
                 ))}
 
@@ -364,24 +371,16 @@ export function StaticMapOverlay({
                 ))}
 
                 {resolved.reminderPx ? (
-                  <G>
-                    <Circle
-                      cx={resolved.reminderPx.x}
-                      cy={resolved.reminderPx.y - 9}
-                      r={15}
-                      fill="#ffffff"
-                      stroke="#334155"
-                      strokeWidth={1.25}
+                  <G
+                    transform={`translate(${resolved.reminderPx.x - 12 * 1.35}, ${resolved.reminderPx.y - 22 * 1.35}) scale(1.35)`}
+                  >
+                    <Path
+                      d={REMINDER_BELL_PATH}
+                      fill="#0f172a"
+                      stroke="#ffffff"
+                      strokeWidth={1.15}
+                      strokeLinejoin="round"
                     />
-                    <SvgText
-                      x={resolved.reminderPx.x}
-                      y={resolved.reminderPx.y - 4}
-                      fontSize={16}
-                      textAnchor="middle"
-                      fill="#334155"
-                    >
-                      🔔
-                    </SvgText>
                   </G>
                 ) : null}
 

@@ -128,10 +128,11 @@ export function SsfAirQualityScreen({
                     if (selected == null) return;
                     try {
                       await setReminder(selected.lat, selected.lon, categoryIndex);
-                    } catch (e) {
-                      const message = e instanceof Error ? e.message : String(e);
-                      Alert.alert('Could not save reminder', message);
-                      throw e;
+                    } catch {
+                      Alert.alert(
+                        'Check your connection',
+                        'We could not save your reminder. Check your connection.',
+                      );
                     }
                   }}
                   onReminderClear={clearReminder}

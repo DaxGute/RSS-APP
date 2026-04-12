@@ -72,6 +72,137 @@ export function idwPoint(
 }
 
 /**
+ * IDW at (lat0, lon0) using **great-circle distance** (km) for neighbor ordering and weights.
+ * `idwPoint` uses Euclidean distance in degrees, which mis-weights neighbors at mid-latitudes
+ * and can skew PM2.5 estimates vs observations.
+ */
+export function idwPointHaversine(
+  lats: number[],
+  lons: number[],
+  vs: number[],
+  lat0: number,
+  lon0: number,
+  opts?: { power?: number; k?: number; epsKm?: number },
+): number | null {
+  const power = opts?.power ?? 2.0;
+  const k = opts?.k ?? 12;
+  const epsKm = opts?.epsKm ?? 1e-6;
+
+  const distKm: number[] = [];
+  const valOk: boolean[] = [];
+  for (let i = 0; i < lats.length; i++) {
+    const lat = lats[i];
+    const lon = lons[i];
+    const v = vs[i];
+    const ok = Number.isFinite(lat) && Number.isFinite(lon) && Number.isFinite(Number(v));
+    valOk.push(ok);
+    if (!ok) {
+      distKm.push(NaN);
+      continue;
+    }
+    distKm.push(haversineKm(lat0, lon0, lat, lon));
+  }
+
+  const df: number[] = [];
+  const vf: number[] = [];
+  for (let i = 0; i < distKm.length; i++) {
+    if (valOk[i] && Number.isFinite(distKm[i])) {
+      df.push(distKm[i]);
+      vf.push(Number(vs[i]));
+    }
+  }
+  if (df.length === 0) return null;
+
+  const kk = Math.max(1, Math.min(k, df.length));
+  const idx = argPartition(df, kk - 1).slice(0, kk);
+  const dk = idx.map((i) => df[i]);
+  const vk = idx.map((i) => vf[i]);
+
+  const minD = Math.min(...dk);
+  if (minD <= epsKm) {
+    const j = dk.indexOf(minD);
+    return vk[j];
+  }
+
+  let num = 0;
+  let den = 0;
+  for (let i = 0; i < dk.length; i++) {
+    const w = 1 / (dk[i] + epsKm) ** power;
+    num += w * vk[i];
+    den += w;
+  }
+  if (!(den > 0)) return null;
+  return num / den;
+}
+
+/**
+ * Haversine-space dual IDW: same neighbor set as `idwPointHaversine` on `primary`, plus
+ * weighted `secondary` (ignores null secondaries in the average).
+ */
+export function idwPointDualHaversine(
+  lats: number[],
+  lons: number[],
+  primary: number[],
+  secondary: (number | null)[],
+  lat0: number,
+  lon0: number,
+  opts?: { power?: number; k?: number; epsKm?: number },
+): { primary: number | null; secondary: number | null } {
+  const power = opts?.power ?? 2.0;
+  const k = opts?.k ?? 12;
+  const epsKm = opts?.epsKm ?? 1e-6;
+
+  const df: number[] = [];
+  const pf: number[] = [];
+  const sf: (number | null)[] = [];
+  for (let i = 0; i < lats.length; i++) {
+    const lat = lats[i];
+    const lon = lons[i];
+    const pv = primary[i];
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(Number(pv))) continue;
+    df.push(haversineKm(lat0, lon0, lat, lon));
+    pf.push(Number(pv));
+    sf.push(secondary[i]);
+  }
+  if (df.length === 0) return { primary: null, secondary: null };
+
+  const kk = Math.max(1, Math.min(k, df.length));
+  const idx = argPartition(df, kk - 1).slice(0, kk);
+  const dk = idx.map((i) => df[i]);
+  const pk = idx.map((i) => pf[i]);
+  const sk = idx.map((i) => sf[i]);
+
+  const minD = Math.min(...dk);
+  if (minD <= epsKm) {
+    const j = dk.indexOf(minD);
+    const sec = sk[j];
+    return {
+      primary: pk[j],
+      secondary: sec != null && Number.isFinite(sec) ? sec : null,
+    };
+  }
+
+  let numP = 0;
+  let den = 0;
+  let numS = 0;
+  let denS = 0;
+  for (let i = 0; i < dk.length; i++) {
+    const w = 1 / (dk[i] + epsKm) ** power;
+    numP += w * pk[i];
+    den += w;
+    const sv = sk[i];
+    if (sv != null && Number.isFinite(sv)) {
+      numS += w * sv;
+      denS += w;
+    }
+  }
+  if (!(den > 0)) return { primary: null, secondary: null };
+  const pOut = numP / den;
+  const sOut = denS > 0 ? numS / denS : null;
+  return { primary: pOut, secondary: sOut };
+}
+
+/**
  * Same neighbor set and IDW weights as `idwPoint` for `primary`, plus a weighted
  * average of `secondary` at those neighbors (only finite secondary values contribute).
  */

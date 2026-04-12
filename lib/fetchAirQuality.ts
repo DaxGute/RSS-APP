@@ -7,6 +7,12 @@ export type FetchError = { message: string; details?: string };
 /** Cap when selecting all sensors for one pipeline `time` (many rows). */
 const SNAPSHOT_ROW_CAP = 50_000;
 
+/**
+ * PostgREST defaults to 1000 rows per request; paginate to load the full kriging grid (~10k+ cells).
+ */
+const KRIGING_PAGE_SIZE = 1000;
+const KRIGING_FETCH_MAX = 50_000;
+
 export type SensorTimeQuery = {
   /**
    * Exact match on the pipeline `time` column (ISO 8601).
@@ -154,12 +160,27 @@ export async function fetchCurrentKrigingGrid(): Promise<{
   data: CurrentKrigingRow[] | null;
   error: FetchError | null;
 }> {
-  const { data, error } = await supabase.from('current_kriging').select('*');
+  const rows: CurrentKrigingRow[] = [];
 
-  if (error) {
-    return { data: null, error: mapError(error) };
+  for (let offset = 0; offset < KRIGING_FETCH_MAX; offset += KRIGING_PAGE_SIZE) {
+    const { data, error } = await supabase
+      .from('current_kriging')
+      .select('*')
+      .order('latitude', { ascending: true })
+      .order('longitude', { ascending: true })
+      .range(offset, offset + KRIGING_PAGE_SIZE - 1);
+
+    if (error) {
+      return { data: null, error: mapError(error) };
+    }
+
+    const batch = (data ?? []) as CurrentKrigingRow[];
+    if (batch.length === 0) break;
+    rows.push(...batch);
+    if (batch.length < KRIGING_PAGE_SIZE) break;
   }
-  return { data: data as CurrentKrigingRow[], error: null };
+
+  return { data: rows, error: null };
 }
 
 const HOUR_MS = 60 * 60 * 1000;

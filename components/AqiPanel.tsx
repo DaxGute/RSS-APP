@@ -1,6 +1,6 @@
 import { FontAwesome } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import {
   Modal,
   Pressable,
@@ -100,6 +100,17 @@ export function AqiPanel({
   const isNarrow = width <= 640;
   const [metric, setMetric] = useState<Metric>('pm25');
   const [reminderModalOpen, setReminderModalOpen] = useState(false);
+  /** Snapshot when modal opens: only then show Clear (avoids Clear appearing mid-close after first-time save). */
+  const [reminderHadClearWhenOpened, setReminderHadClearWhenOpened] = useState(false);
+
+  const openReminderModal = useCallback(() => {
+    setReminderHadClearWhenOpened(reminderBellActive);
+    setReminderModalOpen(true);
+  }, [reminderBellActive]);
+
+  const closeReminderModal = useCallback(() => {
+    setReminderModalOpen(false);
+  }, []);
 
   const compact = sheetMode;
 
@@ -172,7 +183,7 @@ export function AqiPanel({
               <View style={styles.sheetTitleActions}>
                 {showReminderButton ? (
                   <Pressable
-                    onPress={() => setReminderModalOpen(true)}
+                    onPress={openReminderModal}
                     hitSlop={12}
                     style={styles.chromeIconBtnSheet}
                     accessibilityRole="button"
@@ -216,7 +227,7 @@ export function AqiPanel({
                 <View style={styles.shellTopActions}>
                   {showReminderButton ? (
                     <Pressable
-                      onPress={() => setReminderModalOpen(true)}
+                      onPress={openReminderModal}
                       hitSlop={12}
                       style={styles.chromeIconBtn}
                       accessibilityRole="button"
@@ -411,12 +422,12 @@ export function AqiPanel({
         visible={reminderModalOpen}
         transparent
         animationType="fade"
-        onRequestClose={() => setReminderModalOpen(false)}
+        onRequestClose={closeReminderModal}
       >
         <View style={styles.reminderModalRoot}>
           <Pressable
             style={styles.reminderModalBackdrop}
-            onPress={() => setReminderModalOpen(false)}
+            onPress={closeReminderModal}
             accessibilityRole="button"
             accessibilityLabel="Dismiss"
           />
@@ -427,18 +438,21 @@ export function AqiPanel({
               or worse. Only one location can be saved.
             </Text>
             <View style={styles.reminderColorList}>
-              {EPA_AQI_CATEGORY_BANDS.map((row, index) => {
+              {EPA_AQI_CATEGORY_BANDS.slice(1).map((row, i) => {
+                const index = i + 1;
                 const saved = savedReminderCategoryIndex === index;
                 return (
                   <Pressable
                     key={row.cat.label}
-                    onPress={async () => {
-                      try {
-                        await onReminderPickThreshold?.(index);
-                        setReminderModalOpen(false);
-                      } catch {
-                        /* parent shows alert */
-                      }
+                    onPress={() => {
+                      closeReminderModal();
+                      void (async () => {
+                        try {
+                          await onReminderPickThreshold?.(index);
+                        } catch {
+                          /* parent shows alert */
+                        }
+                      })();
                     }}
                     style={({ pressed }) => [
                       styles.reminderColorRow,
@@ -462,11 +476,11 @@ export function AqiPanel({
                 );
               })}
             </View>
-            {reminderBellActive && onReminderClear ? (
+            {reminderHadClearWhenOpened && onReminderClear ? (
               <Pressable
                 onPress={() => {
                   onReminderClear();
-                  setReminderModalOpen(false);
+                  closeReminderModal();
                 }}
                 style={styles.reminderClearBtn}
                 accessibilityRole="button"

@@ -1,7 +1,21 @@
 import type { CurrentKrigingRow } from './database.types';
-import { haversineKm, idwPoint } from './geoUtils';
+import { haversineKm } from './geoUtils';
 import type { SensorPoint } from './sensorTypes';
 import { pm25BreakpointCategory, type Pm25Category } from './aqiUtils';
+
+/** Nearest kriging grid cell (haversine) — uses pipeline values as-is, no IDW on top. */
+function pm25AtNearestKrigingCell(lat0: number, lon0: number, kg: CurrentKrigingRow[]): number | null {
+  let bestPm: number | null = null;
+  let bestD = Infinity;
+  for (const r of kg) {
+    const d = haversineKm(lat0, lon0, r.latitude, r.longitude);
+    if (d < bestD) {
+      bestD = d;
+      bestPm = r.pm25 as number;
+    }
+  }
+  return bestPm;
+}
 
 export function computeSsfSelection(
   lat0: number,
@@ -21,27 +35,6 @@ export function computeSsfSelection(
       Number.isFinite(r.pm25),
   );
 
-  let predPm25: number | null = null;
-  if (kg.length > 0) {
-    predPm25 = idwPoint(
-      kg.map((r) => r.longitude),
-      kg.map((r) => r.latitude),
-      kg.map((r) => r.pm25 as number),
-      lon0,
-      lat0,
-    );
-  } else if (sensors.length > 0) {
-    predPm25 = idwPoint(
-      sensors.map((s) => s.longitude),
-      sensors.map((s) => s.latitude),
-      sensors.map((s) => s.pm25),
-      lon0,
-      lat0,
-    );
-  }
-
-  const predPm25Category = pm25BreakpointCategory(predPm25);
-
   let closest: { lat: number; lon: number; pm25: number; distKm: number } | null = null;
   if (sensors.length > 0) {
     let bestI = 0;
@@ -56,6 +49,11 @@ export function computeSsfSelection(
     const s = sensors[bestI];
     closest = { lat: s.latitude, lon: s.longitude, pm25: s.pm25, distKm: bestD };
   }
+
+  /** Kriging grid only: value at the geographically nearest cell (no second-stage IDW). */
+  const predPm25: number | null = kg.length > 0 ? pm25AtNearestKrigingCell(lat0, lon0, kg) : null;
+
+  const predPm25Category = pm25BreakpointCategory(predPm25);
 
   return { predPm25, predPm25Category, closest };
 }

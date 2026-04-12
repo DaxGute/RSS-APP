@@ -38,6 +38,23 @@ export function coordinateInRegion(lat: number, lon: number, region: MapRegion):
   return lat >= latMin && lat <= latMax && lon >= lonMin && lon <= lonMax;
 }
 
+/** ~1e-4° ≈ 11 m — avoids dropping edge cells to float error; optional pipeline bbox mismatch. */
+const REGION_SLACK_DEG = 2e-4;
+
+/** Like `coordinateInRegion`, but expands the box by `slackDeg` on each side (default `REGION_SLACK_DEG`). */
+export function coordinateInRegionSlack(
+  lat: number,
+  lon: number,
+  region: MapRegion,
+  slackDeg: number = REGION_SLACK_DEG,
+): boolean {
+  const latMin = region.latitude - region.latitudeDelta / 2 - slackDeg;
+  const latMax = region.latitude + region.latitudeDelta / 2 + slackDeg;
+  const lonMin = region.longitude - region.longitudeDelta / 2 - slackDeg;
+  const lonMax = region.longitude + region.longitudeDelta / 2 + slackDeg;
+  return lat >= latMin && lat <= latMax && lon >= lonMin && lon <= lonMax;
+}
+
 const SSF_NORTH = SSF_BBOX.nwLat;
 const SSF_SOUTH = SSF_BBOX.seLat;
 const SSF_WEST = SSF_BBOX.nwLon;
