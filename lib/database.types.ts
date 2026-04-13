@@ -69,6 +69,8 @@ export interface Database {
           notification_lat: number;
           notification_lng: number;
           notification_threshold: number;
+          /** Minutes between notifications (matches app `cooldownMinutes`). */
+          notification_cooldown: number;
           expo_push_token: string;
         };
         Insert: {
@@ -77,6 +79,7 @@ export interface Database {
           notification_lat: number;
           notification_lng: number;
           notification_threshold: number;
+          notification_cooldown: number;
           expo_push_token: string;
         };
         Update: Partial<{
@@ -84,6 +87,7 @@ export interface Database {
           notification_lat: number;
           notification_lng: number;
           notification_threshold: number;
+          notification_cooldown: number;
           expo_push_token: string;
         }>;
         Relationships: [];

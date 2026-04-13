@@ -7,11 +7,15 @@
     "development": {
       "developmentClient": true,
       "distribution": "internal",
+      "environment": "development"
     },
     "preview": {
-      "distribution": "internal"
+      "distribution": "internal",
+      "environment": "preview"
     },
-    "production": {}
+    "production": {
+      "environment": "production"
+    }
   },
   "submit": {
     "production": {}

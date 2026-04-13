@@ -22,6 +22,10 @@ export type AirQualityReminder = {
   lon: number;
   /** Index into `EPA_AQI_CATEGORY_BANDS` (0–5). */
   categoryIndex: number;
+  /** Minimum minutes between local alerts; default 60. */
+  cooldownMinutes: number;
+  /** Epoch ms of last local notification (for cooldown). */
+  lastNotifiedAt?: number;
 };
 
 Notifications.setNotificationHandler({
@@ -59,11 +63,17 @@ async function requestNotifyPermission(): Promise<boolean> {
   return status === 'granted';
 }
 
-/** Writes alert to Supabase: new alert and edits both use upsert on `user_id`. */
+/**
+ * Persists the reminder for server-side Expo push (HTTPS → Expo Push API).
+ * Flow: ensure anonymous Supabase auth (anon key + RLS) → permission already
+ * granted by `setReminder` → Expo push token → upsert on `user_id` so edits
+ * replace the same row.
+ */
 async function writeAlertToSupabase(
   lat: number,
   lon: number,
   categoryIndex: number,
+  cooldownMinutes: number,
 ): Promise<void> {
   const user = await ensureAnonymousSession();
   const userId = user.id;
@@ -76,7 +86,6 @@ async function writeAlertToSupabase(
       projectId ? { projectId: String(projectId) } : undefined,
     );
     expoPushToken = tokenData.data;
-    console.log('EXPO TOKEN:', expoPushToken);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     throw new Error(`Failed to get Expo push token: ${msg}`);
@@ -94,6 +103,7 @@ async function writeAlertToSupabase(
     notification_lat: lat,
     notification_lng: lng,
     notification_threshold: threshold,
+    notification_cooldown: cooldownMinutes,
     expo_push_token: expoPushToken,
   };
 
@@ -118,7 +128,7 @@ export function useAirQualityReminder(
       try {
         const raw = await AsyncStorage.getItem(STORAGE_KEY);
         if (raw) {
-          const parsed = JSON.parse(raw) as AirQualityReminder;
+          const parsed = JSON.parse(raw) as Partial<AirQualityReminder>;
           if (
             typeof parsed.lat === 'number' &&
             typeof parsed.lon === 'number' &&
@@ -126,7 +136,23 @@ export function useAirQualityReminder(
             parsed.categoryIndex >= 0 &&
             parsed.categoryIndex <= 5
           ) {
-            setReminderState(parsed);
+            const cooldownMinutes =
+              typeof parsed.cooldownMinutes === 'number' &&
+              parsed.cooldownMinutes >= 5 &&
+              parsed.cooldownMinutes <= 10080
+                ? Math.round(parsed.cooldownMinutes)
+                : 60;
+            const lastNotifiedAt =
+              typeof parsed.lastNotifiedAt === 'number' && parsed.lastNotifiedAt > 0
+                ? parsed.lastNotifiedAt
+                : undefined;
+            setReminderState({
+              lat: parsed.lat,
+              lon: parsed.lon,
+              categoryIndex: parsed.categoryIndex,
+              cooldownMinutes,
+              lastNotifiedAt,
+            });
           }
         }
       } finally {
@@ -144,21 +170,36 @@ export function useAirQualityReminder(
   }, []);
 
   const setReminder = useCallback(
-    async (lat: number, lon: number, categoryIndex: number) => {
+    async (lat: number, lon: number, categoryIndex: number, cooldownMinutes = 60) => {
       if (categoryIndex < 1 || categoryIndex > 5) {
         throw new Error('Invalid reminder threshold');
+      }
+      if (cooldownMinutes < 5 || cooldownMinutes > 10080) {
+        throw new Error('Invalid cooldown');
       }
 
       const ok = await requestNotifyPermission();
       if (!ok) return;
 
-      const next: AirQualityReminder = { lat, lon, categoryIndex };
-      setReminderState(next);
-      await persist(next);
+      setReminderState((prev) => {
+        const sameSpot =
+          prev != null &&
+          coordsMatch({ lat, lon }, prev) &&
+          prev.categoryIndex === categoryIndex;
+        const next: AirQualityReminder = {
+          lat,
+          lon,
+          categoryIndex,
+          cooldownMinutes: Math.round(cooldownMinutes),
+          lastNotifiedAt: sameSpot ? prev.lastNotifiedAt : undefined,
+        };
+        void persist(next);
+        return next;
+      });
       thresholdCrossRef.current = null;
 
       try {
-        await writeAlertToSupabase(lat, lon, categoryIndex);
+        await writeAlertToSupabase(lat, lon, categoryIndex, Math.round(cooldownMinutes));
       } catch (e) {
         console.error('SAVE FAILED:', e);
         setReminderState(null);
@@ -198,27 +239,39 @@ export function useAirQualityReminder(
     }
 
     if (above && !prev.wasAbove) {
-      void (async () => {
-        try {
-          await Notifications.scheduleNotificationAsync({
-            content: {
-              title: 'Air quality alert',
-              body: 'The estimated AQI at your saved map spot reached your reminder threshold.',
-              sound: true,
-              ...(Platform.OS === 'android'
-                ? { android: { channelId: 'air-quality' } }
-                : {}),
-            },
-            trigger: null,
-          });
-        } catch {
-          /* ignore */
-        }
-      })();
+      const cooldownMs = (reminder.cooldownMinutes ?? 60) * 60 * 1000;
+      const last = reminder.lastNotifiedAt;
+      const withinCooldown = last != null && Date.now() - last < cooldownMs;
+
+      if (!withinCooldown) {
+        void (async () => {
+          try {
+            await Notifications.scheduleNotificationAsync({
+              content: {
+                title: 'Air quality alert',
+                body: 'The estimated AQI at your saved map spot reached your reminder threshold.',
+                sound: true,
+                ...(Platform.OS === 'android'
+                  ? { android: { channelId: 'air-quality' } }
+                  : {}),
+              },
+              trigger: null,
+            });
+            setReminderState((current) => {
+              if (current == null) return current;
+              const next: AirQualityReminder = { ...current, lastNotifiedAt: Date.now() };
+              void persist(next);
+              return next;
+            });
+          } catch {
+            /* ignore */
+          }
+        })();
+      }
     }
 
     thresholdCrossRef.current = { key, wasAbove: above };
-  }, [reminder, sensors, kriging, viewingLive]);
+  }, [reminder, sensors, kriging, viewingLive, persist]);
 
   const isReminderForCoordinate = useCallback(
     (coord: { lat: number; lon: number } | null) => {

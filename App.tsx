@@ -1,8 +1,9 @@
-import { StatusBar } from 'expo-status-bar';
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { StyleSheet, View } from 'react-native';
+import * as SplashScreen from 'expo-splash-screen';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { StatusBar } from 'expo-status-bar';
 
 import { SsfAirQualityScreen } from './components/SsfAirQualityScreen';
 import { useSsfAirQuality } from './hooks/useSsfAirQuality';
@@ -39,9 +40,19 @@ function AppContent() {
 }
 
 export default function App() {
+  const splashHiddenRef = useRef(false);
+
   useEffect(() => {
     void ensureAnonymousSession().catch((err) => {
       console.error('[ensureAnonymousSession]', err);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (splashHiddenRef.current) return;
+    splashHiddenRef.current = true;
+    void SplashScreen.hideAsync().catch((err) => {
+      console.error('[SplashScreen.hideAsync]', err);
     });
   }, []);
 

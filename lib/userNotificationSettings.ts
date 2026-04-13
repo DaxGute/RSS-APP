@@ -30,8 +30,6 @@ export async function upsertUserNotificationSettings(
     .upsert(payload, { onConflict: 'user_id' })
     .select();
 
-  console.log('UPSERT RESULT:', { data, error, payload });
-
   if (error) throw error;
   return data ?? [];
 }

@@ -124,10 +124,26 @@ export function SsfAirQualityScreen({
                   onClose={clearSelection}
                   sheetMode
                   reminderBellActive={isReminderForCoordinate(selected)}
-                  onReminderPickThreshold={async (categoryIndex) => {
+                  onReminderPickThreshold={async (categoryIndex, cooldownMinutes) => {
                     if (selected == null) return;
                     try {
-                      await setReminder(selected.lat, selected.lon, categoryIndex);
+                      await setReminder(selected.lat, selected.lon, categoryIndex, cooldownMinutes);
+                    } catch {
+                      Alert.alert(
+                        'Check your connection',
+                        'We could not save your reminder. Check your connection.',
+                      );
+                    }
+                  }}
+                  onReminderCooldownChange={async (cooldownMinutes) => {
+                    if (reminder == null) return;
+                    try {
+                      await setReminder(
+                        reminder.lat,
+                        reminder.lon,
+                        reminder.categoryIndex,
+                        cooldownMinutes,
+                      );
                     } catch {
                       Alert.alert(
                         'Check your connection',
@@ -137,6 +153,7 @@ export function SsfAirQualityScreen({
                   }}
                   onReminderClear={clearReminder}
                   savedReminderCategoryIndex={reminder?.categoryIndex ?? null}
+                  savedReminderCooldownMinutes={reminder?.cooldownMinutes ?? null}
                 />
               </View>
             </View>

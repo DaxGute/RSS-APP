@@ -42,6 +42,28 @@ function sheetPanelTitle(panel: { kind: string }): string {
   }
 }
 
+/** Preset cooldowns for the reminder modal (minutes). Default selection is 60. Labels are short so the row fits on one line. */
+const REMINDER_COOLDOWN_PRESETS = [
+  { minutes: 30, label: '30m', a11y: '30 minutes' },
+  { minutes: 60, label: '1h', a11y: '1 hour' },
+  { minutes: 300, label: '5h', a11y: '5 hours' },
+  { minutes: 720, label: '12h', a11y: '12 hours' },
+  { minutes: 1440, label: '24h', a11y: '24 hours' },
+] as const;
+
+function nearestReminderCooldownPreset(minutes: number): number {
+  let best: number = REMINDER_COOLDOWN_PRESETS[0].minutes;
+  let bestD = Math.abs(minutes - best);
+  for (const p of REMINDER_COOLDOWN_PRESETS) {
+    const d = Math.abs(minutes - p.minutes);
+    if (d < bestD) {
+      best = p.minutes;
+      bestD = d;
+    }
+  }
+  return best;
+}
+
 function hexToRgba(hex: string, alpha: number): string {
   const h = hex.replace('#', '');
   const full =
@@ -76,10 +98,17 @@ export type AqiPanelProps = {
   /** EPA band index 0–5; when true, the bell uses the filled style for this map selection. */
   reminderBellActive?: boolean;
   /** If provided, a bell appears (when the panel has a valid estimate) to set a single global reminder. */
-  onReminderPickThreshold?: (categoryIndex: number) => void | Promise<void>;
+  onReminderPickThreshold?: (
+    categoryIndex: number,
+    cooldownMinutes: number,
+  ) => void | Promise<void>;
+  /** When a reminder already exists for this spot, persist cooldown changes from the chips. */
+  onReminderCooldownChange?: (cooldownMinutes: number) => void | Promise<void>;
   onReminderClear?: () => void;
   /** Highlights the saved global threshold row in the reminder modal (0–5). */
   savedReminderCategoryIndex?: number | null;
+  /** Saved cooldown for the reminder (minutes); omit or null to use default 60 in the modal. */
+  savedReminderCooldownMinutes?: number | null;
 };
 
 export function AqiPanel({
@@ -93,8 +122,10 @@ export function AqiPanel({
   sheetMode = false,
   reminderBellActive = false,
   onReminderPickThreshold,
+  onReminderCooldownChange,
   onReminderClear,
   savedReminderCategoryIndex = null,
+  savedReminderCooldownMinutes = null,
 }: AqiPanelProps) {
   const { width } = useWindowDimensions();
   const isNarrow = width <= 640;
@@ -102,11 +133,15 @@ export function AqiPanel({
   const [reminderModalOpen, setReminderModalOpen] = useState(false);
   /** Snapshot when modal opens: only then show Clear (avoids Clear appearing mid-close after first-time save). */
   const [reminderHadClearWhenOpened, setReminderHadClearWhenOpened] = useState(false);
+  const [reminderCooldownMinutes, setReminderCooldownMinutes] = useState(60);
 
   const openReminderModal = useCallback(() => {
     setReminderHadClearWhenOpened(reminderBellActive);
+    setReminderCooldownMinutes(
+      nearestReminderCooldownPreset(savedReminderCooldownMinutes ?? 60),
+    );
     setReminderModalOpen(true);
-  }, [reminderBellActive]);
+  }, [reminderBellActive, savedReminderCooldownMinutes]);
 
   const closeReminderModal = useCallback(() => {
     setReminderModalOpen(false);
@@ -448,7 +483,7 @@ export function AqiPanel({
                       closeReminderModal();
                       void (async () => {
                         try {
-                          await onReminderPickThreshold?.(index);
+                          await onReminderPickThreshold?.(index, reminderCooldownMinutes);
                         } catch {
                           /* parent shows alert */
                         }
@@ -475,6 +510,51 @@ export function AqiPanel({
                   </Pressable>
                 );
               })}
+            </View>
+            <View style={styles.reminderCooldownBlock}>
+              <Text style={styles.reminderCooldownLabel}>Minimum time between alerts</Text>
+              <Text style={styles.reminderCooldownHint}>
+                After a notification, wait this long before the next one at this spot.
+              </Text>
+              <View style={styles.reminderCooldownChips}>
+                {REMINDER_COOLDOWN_PRESETS.map((p) => {
+                  const selected = reminderCooldownMinutes === p.minutes;
+                  return (
+                    <Pressable
+                      key={p.minutes}
+                      onPress={() => {
+                        if (reminderCooldownMinutes === p.minutes) return;
+                        setReminderCooldownMinutes(p.minutes);
+                        const hasSavedReminderHere =
+                          reminderBellActive &&
+                          savedReminderCategoryIndex != null &&
+                          savedReminderCategoryIndex >= 1;
+                        if (hasSavedReminderHere) {
+                          void onReminderCooldownChange?.(p.minutes);
+                        }
+                      }}
+                      style={({ pressed }) => [
+                        styles.reminderCooldownChip,
+                        selected && styles.reminderCooldownChipSelected,
+                        pressed && styles.reminderCooldownChipPressed,
+                      ]}
+                      accessibilityRole="button"
+                      accessibilityState={{ selected }}
+                      accessibilityLabel={`Cooldown ${p.a11y}`}
+                    >
+                      <Text
+                        style={[
+                          styles.reminderCooldownChipText,
+                          selected && styles.reminderCooldownChipTextSelected,
+                        ]}
+                        numberOfLines={1}
+                      >
+                        {p.label}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
             </View>
             {reminderHadClearWhenOpened && onReminderClear ? (
               <Pressable
@@ -1002,6 +1082,59 @@ const styles = StyleSheet.create({
   },
   reminderBandRangeSaved: {
     color: '#2563eb',
+  },
+  reminderCooldownBlock: {
+    marginTop: 14,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(15,23,42,0.08)',
+  },
+  reminderCooldownLabel: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: '#0f172a',
+    marginBottom: 4,
+  },
+  reminderCooldownHint: {
+    fontSize: 11,
+    color: '#64748b',
+    lineHeight: 15,
+    marginBottom: 10,
+  },
+  reminderCooldownChips: {
+    flexDirection: 'row',
+    alignItems: 'stretch',
+    width: '100%',
+    gap: 4,
+  },
+  reminderCooldownChip: {
+    flex: 1,
+    minWidth: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 6,
+    paddingHorizontal: 2,
+    borderRadius: 999,
+    backgroundColor: 'rgba(241,245,249,0.95)',
+    borderWidth: 1,
+    borderColor: 'rgba(15,23,42,0.08)',
+  },
+  reminderCooldownChipSelected: {
+    backgroundColor: 'rgba(37, 99, 235, 0.12)',
+    borderColor: '#2563eb',
+  },
+  reminderCooldownChipPressed: {
+    opacity: 0.85,
+  },
+  reminderCooldownChipText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#475569',
+    fontVariant: ['tabular-nums'],
+    textAlign: 'center',
+  },
+  reminderCooldownChipTextSelected: {
+    color: '#1d4ed8',
   },
   reminderClearBtn: {
     marginTop: 14,
