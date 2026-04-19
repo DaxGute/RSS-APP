@@ -123,6 +123,7 @@ export function SsfAirQualityScreen({
                   mapRegion={mapRegion}
                   onClose={clearSelection}
                   sheetMode
+                  healthTooltipPlacement={panelSlot === 'bottom' ? 'above' : 'below'}
                   reminderBellActive={isReminderForCoordinate(selected)}
                   onReminderPickThreshold={async (categoryIndex, cooldownMinutes) => {
                     if (selected == null) return;
