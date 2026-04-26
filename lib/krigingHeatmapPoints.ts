@@ -6,7 +6,10 @@ import type { CurrentKrigingRow } from './database.types';
 export type HeatmapPoint = {
   latitude: number;
   longitude: number;
+  pm25: number;
   weight: number;
+  /** Value-scaled opacity [~0.35..1] so cleaner air remains visible but lighter. */
+  intensityOpacity: number;
   /**
    * Splat opacity multiplier (~0.25–1), from each row’s `kriging_variance` when present.
    * Higher variance → lower opacity. 1 when variance data is unavailable (constant strength).
@@ -44,11 +47,13 @@ export function buildKrigingHeatmapPoints(kriging: CurrentKrigingRow[], region: 
   const hasVariance = variances.some((v) => v != null);
   const finiteVars = variances.filter((v): v is number => v != null && Number.isFinite(v) && v >= 0);
   const maxVar = finiteVars.length > 0 ? Math.max(...finiteVars, 1e-12) : 0;
+  const maxPm = Math.max(...sources.map((p) => p.pm25 as number), 1e-9);
 
   return sources.map((p) => {
     const pm = p.pm25 as number;
     const aqi = pm25ToAqi(pm);
     const w = aqi != null && Number.isFinite(aqi) ? Math.max(1, Math.min(500, aqi)) : 1;
+    const intensityOpacity = Math.max(0.35, Math.min(1, 0.35 + 0.65 * (pm / maxPm)));
 
     let varianceOpacity = 1;
     if (hasVariance && maxVar > 0) {
@@ -65,7 +70,9 @@ export function buildKrigingHeatmapPoints(kriging: CurrentKrigingRow[], region: 
     return {
       latitude: p.latitude,
       longitude: p.longitude,
+      pm25: pm,
       weight: w,
+      intensityOpacity,
       varianceOpacity,
     };
   });

@@ -328,8 +328,8 @@ export function StaticMapOverlay({
                       fy="50%"
                       gradientUnits="objectBoundingBox"
                     >
-                      <Stop offset="0%" stopColor={c} stopOpacity={0.12} />
-                      <Stop offset="45%" stopColor={c} stopOpacity={0.035} />
+                      <Stop offset="0%" stopColor={c} stopOpacity={0.34} />
+                      <Stop offset="45%" stopColor={c} stopOpacity={0.12} />
                       <Stop offset="100%" stopColor={c} stopOpacity={0} />
                     </RadialGradient>
                   ))}

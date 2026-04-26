@@ -1,6 +1,6 @@
 import { supabase } from './supabase';
 
-import type { ClarityRow, CurrentKrigingRow, PurpleAirRow } from './database.types';
+import type { ClarityRow, CurrentKrigingRow, DailySensorAqiRow, PurpleAirRow } from './database.types';
 
 export type FetchError = { message: string; details?: string };
 
@@ -10,8 +10,12 @@ const SNAPSHOT_ROW_CAP = 50_000;
 /**
  * PostgREST defaults to 1000 rows per request; paginate to load the full kriging grid (~10k+ cells).
  */
-const KRIGING_PAGE_SIZE = 1000;
-const KRIGING_FETCH_MAX = 50_000;
+const KRIGING_PAGE_SIZE = 5000;
+const KRIGING_MAX_PAGES = 200;
+const SENSOR_COLUMNS = 'sensor_index,latitude,longitude,pm25,time';
+const KRIGING_COLUMNS = 'latitude,longitude,pm25,time';
+const DAILY_SENSOR_AQI_COLUMNS =
+  'source,sensor_index,name,latitude,longitude,pm25,aqi,time,reading_count';
 
 export type SensorTimeQuery = {
   /**
@@ -60,7 +64,7 @@ function applySensorTimeFilters<T extends { gte: Function; lte: Function; eq: Fu
 export async function fetchPurpleAirReadings(
   options?: SensorTimeQuery,
 ): Promise<{ data: PurpleAirRow[] | null; error: FetchError | null }> {
-  const base = supabase.from('purple_air').select('*');
+  const base = supabase.from('purple_air').select(SENSOR_COLUMNS);
   const { data, error } = await applySensorTimeFilters(base, options);
 
   if (error) {
@@ -72,7 +76,7 @@ export async function fetchPurpleAirReadings(
 export async function fetchClarityReadings(
   options?: SensorTimeQuery,
 ): Promise<{ data: ClarityRow[] | null; error: FetchError | null }> {
-  const base = supabase.from('clarity').select('*');
+  const base = supabase.from('clarity').select(SENSOR_COLUMNS);
   const { data, error } = await applySensorTimeFilters(base, options);
 
   if (error) {
@@ -127,6 +131,186 @@ export async function fetchSensorReadingsAtRecordedTime(recordedTime: string): P
 }
 
 /**
+ * All PurpleAir + Clarity rows in an inclusive recorded-time range.
+ * Use for day-level summaries (e.g., calendar heat cells).
+ */
+export async function fetchSensorReadingsBetweenRecordedTimes(
+  fromRecordedTime: string,
+  toRecordedTime: string,
+): Promise<{
+  purpleAir: PurpleAirRow[] | null;
+  clarity: ClarityRow[] | null;
+  error: FetchError | null;
+}> {
+  const [purple, clarity] = await Promise.all([
+    fetchPurpleAirReadings({
+      fromRecordedTime,
+      toRecordedTime,
+      limit: SNAPSHOT_ROW_CAP,
+    }),
+    fetchClarityReadings({
+      fromRecordedTime,
+      toRecordedTime,
+      limit: SNAPSHOT_ROW_CAP,
+    }),
+  ]);
+  const err = purple.error ?? clarity.error;
+  return {
+    purpleAir: purple.data,
+    clarity: clarity.data,
+    error: err,
+  };
+}
+
+export async function fetchDailySensorAqiBetweenRecordedTimes(
+  fromRecordedTime: string,
+  toRecordedTime: string,
+): Promise<{
+  data: DailySensorAqiRow[] | null;
+  error: FetchError | null;
+}> {
+  const { data, error } = await supabase
+    .from('daily_sensor_aqi')
+    .select(DAILY_SENSOR_AQI_COLUMNS)
+    .gte('time', fromRecordedTime)
+    .lte('time', toRecordedTime)
+    .order('time', { ascending: true })
+    .limit(SNAPSHOT_ROW_CAP);
+
+  if (error) {
+    return { data: null, error: mapError(error) };
+  }
+  return { data: (data ?? []) as DailySensorAqiRow[], error: null };
+}
+
+export async function fetchDailySensorAqiAtRecordedTime(
+  recordedTime: string,
+): Promise<{
+  data: DailySensorAqiRow[] | null;
+  error: FetchError | null;
+}> {
+  const { data, error } = await supabase
+    .from('daily_sensor_aqi')
+    .select(DAILY_SENSOR_AQI_COLUMNS)
+    .eq('time', recordedTime)
+    .order('sensor_index', { ascending: true })
+    .limit(SNAPSHOT_ROW_CAP);
+  if (error) {
+    return { data: null, error: mapError(error) };
+  }
+  return { data: (data ?? []) as DailySensorAqiRow[], error: null };
+}
+
+export async function fetchDailySensorAqiCalendarRows(): Promise<{
+  data: DailySensorAqiRow[] | null;
+  error: FetchError | null;
+}> {
+  const { data, error } = await supabase
+    .from('daily_sensor_aqi')
+    .select('time,aqi,pm25')
+    .order('time', { ascending: true })
+    .limit(50_000);
+  if (error) {
+    return { data: null, error: mapError(error) };
+  }
+  return { data: (data ?? []) as DailySensorAqiRow[], error: null };
+}
+
+export async function fetchDailySensorAqiCalendarRowsForMonth(
+  fromRecordedTime: string,
+  toRecordedTime: string,
+): Promise<{
+  data: DailySensorAqiRow[] | null;
+  error: FetchError | null;
+}> {
+  const { data, error } = await supabase
+    .from('daily_sensor_aqi')
+    .select('time,aqi,pm25')
+    .gte('time', fromRecordedTime)
+    .lte('time', toRecordedTime)
+    .order('time', { ascending: true })
+    .limit(50_000);
+  if (error) {
+    return { data: null, error: mapError(error) };
+  }
+  return { data: (data ?? []) as DailySensorAqiRow[], error: null };
+}
+
+export async function fetchKrigingGridAtRecordedTime(recordedTime: string): Promise<{
+  data: CurrentKrigingRow[] | null;
+  error: FetchError | null;
+}> {
+  const rows: CurrentKrigingRow[] = [];
+  for (let page = 0; page < KRIGING_MAX_PAGES; page++) {
+    const offset = page * KRIGING_PAGE_SIZE;
+    const { data, error } = await supabase
+      .from('current_kriging')
+      .select(KRIGING_COLUMNS)
+      .eq('time', recordedTime)
+      .order('latitude', { ascending: true })
+      .order('longitude', { ascending: true })
+      .range(offset, offset + KRIGING_PAGE_SIZE - 1);
+    if (error) return { data: null, error: mapError(error) };
+    const batch = ((data ?? []) as Array<Partial<CurrentKrigingRow>>).map((row) => ({
+      latitude: row.latitude as number,
+      longitude: row.longitude as number,
+      pm25: row.pm25 ?? null,
+      time: row.time ?? recordedTime,
+      kriging_variance: row.kriging_variance ?? null,
+      aqi: row.aqi ?? null,
+    }));
+    if (batch.length === 0) break;
+    rows.push(...batch);
+    if (batch.length < KRIGING_PAGE_SIZE) break;
+  }
+  return { data: rows, error: null };
+}
+
+export async function fetchNearestKrigingRecordedTime(
+  recordedTime: string,
+  lookbackHours = 24,
+): Promise<{ recordedTime: string | null; error: FetchError | null }> {
+  const targetMs = new Date(recordedTime).getTime();
+  if (!Number.isFinite(targetMs)) {
+    return { recordedTime: null, error: { message: 'Invalid recorded time' } };
+  }
+  const from = new Date(targetMs - lookbackHours * HOUR_MS).toISOString();
+  const [beforeRes, afterRes] = await Promise.all([
+    supabase
+      .from('current_kriging')
+      .select('time')
+      .gte('time', from)
+      .lte('time', recordedTime)
+      .order('time', { ascending: false })
+      .limit(1),
+    supabase
+      .from('current_kriging')
+      .select('time')
+      .gte('time', recordedTime)
+      .order('time', { ascending: true })
+      .limit(1),
+  ]);
+
+  const err = beforeRes.error ?? afterRes.error;
+  if (err) {
+    return { recordedTime: null, error: mapError(err) };
+  }
+
+  const beforeTime = ((beforeRes.data ?? [])[0] as { time?: string } | undefined)?.time ?? null;
+  const afterTime = ((afterRes.data ?? [])[0] as { time?: string } | undefined)?.time ?? null;
+  if (!beforeTime && !afterTime) {
+    return { recordedTime: null, error: null };
+  }
+
+  if (!beforeTime) return { recordedTime: afterTime, error: null };
+  if (!afterTime) return { recordedTime: beforeTime, error: null };
+
+  const beforeDelta = Math.abs(new Date(beforeTime).getTime() - targetMs);
+  const afterDelta = Math.abs(new Date(afterTime).getTime() - targetMs);
+  return { recordedTime: beforeDelta <= afterDelta ? beforeTime : afterTime, error: null };
+}
+
+/**
  * Latest snapshot per source: resolves the newest `time` in each table, then loads all rows for that time.
  * Prefer this for “current” sensor readings when each pipeline run stamps one shared `time`.
  */
@@ -162,10 +346,11 @@ export async function fetchCurrentKrigingGrid(): Promise<{
 }> {
   const rows: CurrentKrigingRow[] = [];
 
-  for (let offset = 0; offset < KRIGING_FETCH_MAX; offset += KRIGING_PAGE_SIZE) {
+  for (let page = 0; page < KRIGING_MAX_PAGES; page++) {
+    const offset = page * KRIGING_PAGE_SIZE;
     const { data, error } = await supabase
       .from('current_kriging')
-      .select('*')
+      .select(KRIGING_COLUMNS)
       .order('latitude', { ascending: true })
       .order('longitude', { ascending: true })
       .range(offset, offset + KRIGING_PAGE_SIZE - 1);
@@ -174,7 +359,15 @@ export async function fetchCurrentKrigingGrid(): Promise<{
       return { data: null, error: mapError(error) };
     }
 
-    const batch = (data ?? []) as CurrentKrigingRow[];
+    const batch = ((data ?? []) as Array<Partial<CurrentKrigingRow>>).map((row) => ({
+      latitude: row.latitude as number,
+      longitude: row.longitude as number,
+      pm25: row.pm25 ?? null,
+      time: row.time ?? new Date(0).toISOString(),
+      // Optional in some deployments; keep null when absent.
+      kriging_variance: row.kriging_variance ?? null,
+      aqi: row.aqi ?? null,
+    }));
     if (batch.length === 0) break;
     rows.push(...batch);
     if (batch.length < KRIGING_PAGE_SIZE) break;

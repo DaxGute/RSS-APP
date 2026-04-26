@@ -1,4 +1,4 @@
-export type SensorSource = 'purple_air' | 'clarity';
+export type SensorSource = 'purple_air' | 'clarity' | string;
 
 export type SensorPoint = {
   sensorIndex: number;

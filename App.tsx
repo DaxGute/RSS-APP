@@ -14,12 +14,16 @@ function AppContent() {
     sensors,
     kriging,
     loading,
+    initialLoadProgress,
     error,
     timelineTimesAsc,
     timelineIndex,
     setTimelineIndex,
+    selectRecordedTime,
     viewingLive,
     timelineLoading,
+    insufficientData,
+    liveAverageAqi,
   } = useSsfAirQuality();
 
   return (
@@ -28,12 +32,16 @@ function AppContent() {
         sensors={sensors}
         kriging={kriging}
         loading={loading}
+        initialLoadProgress={initialLoadProgress}
         error={error}
         timelineTimesAsc={timelineTimesAsc}
         timelineIndex={timelineIndex}
         onTimelineIndexChange={setTimelineIndex}
+        onSelectRecordedTime={selectRecordedTime}
         viewingLive={viewingLive}
         timelineLoading={timelineLoading}
+        insufficientData={insufficientData}
+        liveAverageAqi={liveAverageAqi}
       />
     </View>
   );

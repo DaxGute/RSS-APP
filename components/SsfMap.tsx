@@ -6,6 +6,7 @@ import { SSF_GEO_BOUNDS } from '../lib/constants/ssfGeo';
 import { pm25ToAqi } from '../lib/aqiUtils';
 import { buildKrigingHeatmapPoints } from '../lib/krigingHeatmapPoints';
 import { getColorFromAqi } from '../lib/metricColor';
+import { pm25ToGradientColor } from '../lib/pm25ColorScale';
 import type { MapRegion } from '../lib/mapRegionFromData';
 import type { SensorPoint } from '../lib/sensorTypes';
 import { StaticMapOverlay } from './StaticMapOverlay';
@@ -54,7 +55,9 @@ export function SsfMap({
       lon: p.longitude,
       value: Math.round(p.weight),
       heatmapSplat: true as const,
-      opacity: p.varianceOpacity,
+      color: pm25ToGradientColor(p.pm25),
+      // Keep the kriging field visible across the map; modulate within a strong floor.
+      opacity: Math.max(0.62, Math.min(1, p.varianceOpacity * (0.6 + 0.4 * p.intensityOpacity))),
     }));
     const sens = sensors.map((s) => ({
       lat: s.latitude,

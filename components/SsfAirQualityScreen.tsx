@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useState } from 'react';
-import { ActivityIndicator, Alert, StyleSheet, Text, View } from 'react-native';
+import { Alert, Image, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import type { CurrentKrigingRow } from '../lib/database.types';
@@ -22,24 +22,32 @@ export type SsfAirQualityScreenProps = {
   sensors: SensorPoint[];
   kriging: CurrentKrigingRow[];
   loading: boolean;
+  initialLoadProgress: number;
   error: FetchError | null;
   timelineTimesAsc: string[];
   timelineIndex: number;
   onTimelineIndexChange: (index: number) => void;
+  onSelectRecordedTime: (recordedTime: string) => void;
   viewingLive: boolean;
   timelineLoading: boolean;
+  insufficientData: boolean;
+  liveAverageAqi: number | null;
 };
 
 export function SsfAirQualityScreen({
   sensors,
   kriging,
   loading,
+  initialLoadProgress,
   error,
   timelineTimesAsc,
   timelineIndex,
   onTimelineIndexChange,
+  onSelectRecordedTime,
   viewingLive,
   timelineLoading,
+  insufficientData,
+  liveAverageAqi,
 }: SsfAirQualityScreenProps) {
   const insets = useSafeAreaInsets();
 
@@ -47,6 +55,29 @@ export function SsfAirQualityScreen({
   const [panelSlot, setPanelSlot] = useState<PanelSlot>('bottom');
 
   const mapRegion = useMemo(() => regionFromSensorData(sensors, kriging), [sensors, kriging]);
+  const selectedTimeIsoForUi = useMemo(
+    () => timelineTimesAsc[timelineIndex] ?? (timelineTimesAsc.length === 0 ? new Date().toISOString() : null),
+    [timelineIndex, timelineTimesAsc],
+  );
+  const selectedTimeInPastDay = useMemo(() => {
+    if (!selectedTimeIsoForUi) return false;
+    const selected = new Date(selectedTimeIsoForUi);
+    if (!Number.isFinite(selected.getTime())) return false;
+    const ageMs = Date.now() - selected.getTime();
+    return ageMs >= 0 && ageMs <= 24 * 60 * 60 * 1000;
+  }, [selectedTimeIsoForUi]);
+  const timelineTimesForUi = useMemo(
+    () =>
+      timelineTimesAsc.length === 0 && selectedTimeInPastDay
+        ? [new Date().toISOString()]
+        : timelineTimesAsc,
+    [selectedTimeInPastDay, timelineTimesAsc],
+  );
+  const timelineIndexForUi = useMemo(
+    () =>
+      timelineTimesForUi.length > 0 ? Math.min(timelineIndex, timelineTimesForUi.length - 1) : 0,
+    [timelineIndex, timelineTimesForUi],
+  );
 
   const { reminder, setReminder, clearReminder, isReminderForCoordinate } = useAirQualityReminder(
     sensors,
@@ -81,8 +112,12 @@ export function SsfAirQualityScreen({
           <View style={styles.mapCol}>
             {loading && sensors.length === 0 && kriging.length === 0 ? (
               <View style={styles.loadingOverlay} pointerEvents="none">
-                <ActivityIndicator color="#475569" />
-                <Text style={styles.loadingText}>Loading Supabase data…</Text>
+                <Image source={require('../assets/rise-south-city-logo.png')} style={styles.loadingLogo} />
+                <Text style={styles.loadingText}>Loading PurpleAir and Clarity data...</Text>
+                <View style={styles.progressTrack}>
+                  <View style={[styles.progressFill, { width: `${Math.max(8, Math.min(100, initialLoadProgress * 100))}%` }]} />
+                </View>
+                <Text style={styles.progressText}>{Math.round(initialLoadProgress * 100)}%</Text>
               </View>
             ) : null}
             <SsfMap
@@ -95,8 +130,12 @@ export function SsfAirQualityScreen({
               }
               onSelectCoordinate={onSelectCoordinate}
             />
+            {!viewingLive && insufficientData ? (
+              <View style={styles.insufficientWrap} pointerEvents="none">
+                <Text style={styles.insufficientText}>Insufficient Data</Text>
+              </View>
+            ) : null}
           </View>
-
           {selected ? (
             <View
               style={[
@@ -161,11 +200,17 @@ export function SsfAirQualityScreen({
           ) : null}
 
           <ReadingTimeline
-            timesAsc={timelineTimesAsc}
-            selectedIndex={timelineIndex}
-            onChangeIndex={onTimelineIndexChange}
+            timesAsc={timelineTimesForUi}
+            selectedIndex={timelineIndexForUi}
+            onChangeIndex={(index) => {
+              if (timelineTimesAsc.length === 0) return;
+              onTimelineIndexChange(index);
+            }}
             viewingLive={viewingLive}
+            showCurrentDayHistoryLabel={selectedTimeInPastDay}
             loading={timelineLoading}
+            onPickRecordedTime={onSelectRecordedTime}
+            liveAverageAqi={liveAverageAqi}
           />
         </View>
       </View>
@@ -178,15 +223,47 @@ const styles = StyleSheet.create({
   screenContent: { flex: 1, position: 'relative' },
   main: { flex: 1, minHeight: 0 },
   mapCol: { flex: 1, minHeight: 0, zIndex: 0 },
+  insufficientWrap: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 3,
+  },
+  insufficientText: {
+    color: '#dc2626',
+    fontSize: 22,
+    fontWeight: '800',
+    textShadowColor: 'rgba(255,255,255,0.95)',
+    textShadowRadius: 6,
+    textShadowOffset: { width: 0, height: 0 },
+  },
   loadingOverlay: {
     ...StyleSheet.absoluteFillObject,
     zIndex: 2,
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 10,
+    gap: 12,
     backgroundColor: 'rgba(241,245,249,0.72)',
   },
-  loadingText: { fontSize: 13, color: '#475569' },
+  loadingLogo: {
+    width: 144,
+    height: 144,
+    resizeMode: 'contain',
+  },
+  loadingText: { fontSize: 13, color: '#334155', fontWeight: '600' },
+  progressTrack: {
+    width: 220,
+    height: 8,
+    borderRadius: 999,
+    backgroundColor: '#cbd5e1',
+    overflow: 'hidden',
+  },
+  progressFill: {
+    height: '100%',
+    borderRadius: 999,
+    backgroundColor: '#1e3a8a',
+  },
+  progressText: { fontSize: 12, color: '#475569' },
   sheetWrapBottom: {
     position: 'absolute',
     left: 0,

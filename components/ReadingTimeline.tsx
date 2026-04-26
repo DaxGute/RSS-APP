@@ -1,5 +1,5 @@
 import { Ionicons } from '@expo/vector-icons';
-import { useCallback, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Animated,
@@ -14,6 +14,7 @@ import {
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { TimelineCalendarModal } from './TimelineCalendarModal';
 
 /** Horizontal slot width for each time in the dial carousel. */
 const ITEM_WIDTH = 104;
@@ -83,7 +84,10 @@ export type ReadingTimelineProps = {
   selectedIndex: number;
   onChangeIndex: (index: number) => void;
   viewingLive: boolean;
+  showCurrentDayHistoryLabel?: boolean;
   loading?: boolean;
+  onPickRecordedTime?: (recordedTime: string) => void;
+  liveAverageAqi?: number | null;
 };
 
 export function ReadingTimeline({
@@ -91,18 +95,48 @@ export function ReadingTimeline({
   selectedIndex,
   onChangeIndex,
   viewingLive,
+  showCurrentDayHistoryLabel = true,
   loading = false,
+  onPickRecordedTime,
+  liveAverageAqi = null,
 }: ReadingTimelineProps) {
   const insets = useSafeAreaInsets();
   const { width: screenW } = useWindowDimensions();
   const listRef = useRef<FlatList<string>>(null);
   const scrollX = useRef(new Animated.Value(0)).current;
+  const calendarButtonScale = useRef(new Animated.Value(1)).current;
   const [scrollEdges, setScrollEdges] = useState({ left: false, right: false });
+  const [calendarOpen, setCalendarOpen] = useState(false);
+  const didInitialScrollRef = useRef(false);
 
   const maxIdx = Math.max(0, timesAsc.length - 1);
   const safeIndex = Math.min(Math.max(0, selectedIndex), maxIdx);
 
   const sidePad = useMemo(() => Math.max(0, (screenW - ITEM_WIDTH) / 2), [screenW]);
+
+  const updateScrollEdges = useCallback(
+    (offset: number) => {
+      const maxX = maxIdx * ITEM_WIDTH;
+      setScrollEdges({
+        left: offset > 6,
+        right: maxX > 6 && offset < maxX - 6,
+      });
+    },
+    [maxIdx],
+  );
+
+  const scrollToIndex = useCallback(
+    (index: number, animated: boolean) => {
+      const clamped = Math.min(maxIdx, Math.max(0, index));
+      const offset = clamped * ITEM_WIDTH;
+      if (!animated) {
+        scrollX.setValue(offset);
+      }
+      listRef.current?.scrollToOffset({ offset, animated });
+      updateScrollEdges(offset);
+    },
+    [maxIdx, scrollX, updateScrollEdges],
+  );
 
   const snapToIndex = useCallback(
     (e: NativeSyntheticEvent<NativeScrollEvent>) => {
@@ -113,20 +147,21 @@ export function ReadingTimeline({
     [maxIdx, onChangeIndex],
   );
 
-  useLayoutEffect(() => {
-    const offset = safeIndex * ITEM_WIDTH;
-    scrollX.setValue(offset);
-    listRef.current?.scrollToOffset({ offset, animated: false });
-    setScrollEdges({
-      left: safeIndex > 0,
-      right: safeIndex < maxIdx,
-    });
-  }, [safeIndex, timesAsc.length, maxIdx, scrollX]);
+  useEffect(() => {
+    // First layout should lock to the selected value without visual jump.
+    if (!didInitialScrollRef.current) {
+      didInitialScrollRef.current = true;
+      scrollToIndex(safeIndex, false);
+      return;
+    }
+    // Subsequent index updates animate (including tap-to-jump).
+    scrollToIndex(safeIndex, true);
+  }, [safeIndex, scrollToIndex, timesAsc.length]);
 
   const onScroll = useMemo(
     () =>
       Animated.event([{ nativeEvent: { contentOffset: { x: scrollX } } }], {
-        useNativeDriver: false,
+        useNativeDriver: true,
         listener: (e: NativeSyntheticEvent<NativeScrollEvent>) => {
           const { contentOffset, layoutMeasurement, contentSize } = e.nativeEvent;
           const maxX = Math.max(0, contentSize.width - layoutMeasurement.width);
@@ -147,11 +182,33 @@ export function ReadingTimeline({
         label={formatDialTime(item)}
         scrollX={scrollX}
         itemWidth={ITEM_WIDTH}
-        onPick={() => onChangeIndex(index)}
+        onPick={() => {
+          scrollToIndex(index, true);
+          onChangeIndex(index);
+        }}
       />
     ),
-    [onChangeIndex, scrollX],
+    [onChangeIndex, scrollToIndex, scrollX],
   );
+
+  const openCalendar = useCallback(() => {
+    if (!onPickRecordedTime) return;
+    Animated.sequence([
+      Animated.timing(calendarButtonScale, { toValue: 0.94, duration: 80, useNativeDriver: true }),
+      Animated.spring(calendarButtonScale, {
+        toValue: 1,
+        damping: 12,
+        stiffness: 220,
+        mass: 0.9,
+        useNativeDriver: true,
+      }),
+    ]).start();
+    setCalendarOpen(true);
+  }, [calendarButtonScale, onPickRecordedTime]);
+
+  const closeCalendar = useCallback(() => {
+    setCalendarOpen(false);
+  }, []);
 
   if (timesAsc.length === 0) {
     return null;
@@ -168,8 +225,21 @@ export function ReadingTimeline({
       ]}
     >
       <View style={styles.metaRow} pointerEvents="box-none">
-        <Text style={styles.metaLabel}>Past 24h</Text>
+        {showCurrentDayHistoryLabel ? <Text style={styles.metaLabel}>Past 24h</Text> : null}
         {loading ? <ActivityIndicator size="small" color="#475569" style={styles.spinner} /> : null}
+        {onPickRecordedTime ? (
+          <Animated.View style={{ transform: [{ scale: calendarButtonScale }] }}>
+            <Pressable
+              onPress={openCalendar}
+              style={({ pressed }) => [styles.calendarButton, pressed && styles.calendarButtonPressed]}
+              accessibilityRole="button"
+              accessibilityLabel="Open date calendar"
+            >
+              <Ionicons name="calendar-outline" size={15} color="#1f2937" />
+              <Text style={styles.calendarButtonText}>Date</Text>
+            </Pressable>
+          </Animated.View>
+        ) : null}
         {maxIdx > 0 ? (
           <Text style={styles.swipeCue} pointerEvents="none">
             Swipe
@@ -215,6 +285,16 @@ export function ReadingTimeline({
           renderItem={renderItem}
         />
       </View>
+      {onPickRecordedTime ? (
+        <TimelineCalendarModal
+          visible={calendarOpen}
+          onClose={closeCalendar}
+          timelineTimesAsc={timesAsc}
+          timelineIndex={safeIndex}
+          onPickRecordedTime={onPickRecordedTime}
+          liveAverageAqi={liveAverageAqi}
+        />
+      ) : null}
     </View>
   );
 }
@@ -246,6 +326,31 @@ const styles = StyleSheet.create({
     textShadowRadius: 4,
   },
   spinner: { marginVertical: -2 },
+  calendarButton: {
+    minHeight: 24,
+    paddingHorizontal: 8,
+    borderRadius: 999,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: 'rgba(255,255,255,0.94)',
+    borderWidth: 1,
+    borderColor: '#dbe5f2',
+    shadowColor: '#0f172a',
+    shadowOpacity: 0.12,
+    shadowRadius: 5,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 3,
+  },
+  calendarButtonPressed: {
+    opacity: 0.9,
+  },
+  calendarButtonText: {
+    fontSize: 11,
+    fontWeight: '800',
+    letterSpacing: 0.2,
+    color: '#334155',
+  },
   metaLive: {
     fontSize: 11,
     fontWeight: '800',

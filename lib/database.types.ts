@@ -40,6 +40,18 @@ export interface CurrentKrigingRow {
   time: string;
 }
 
+export interface DailySensorAqiRow {
+  source: string;
+  sensor_index: number;
+  name: string | null;
+  latitude: number;
+  longitude: number;
+  pm25: number | null;
+  aqi: number | null;
+  time: string;
+  reading_count: number | null;
+}
+
 /** Supabase client generic: maps public table names to Row types. */
 export interface Database {
   public: {
@@ -58,6 +70,12 @@ export interface Database {
       };
       current_kriging: {
         Row: CurrentKrigingRow;
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
+      daily_sensor_aqi: {
+        Row: DailySensorAqiRow;
         Insert: never;
         Update: never;
         Relationships: [];
