@@ -44,6 +44,7 @@ export function TimelineCalendarModal({
   const selectedIso = timelineTimesAsc[timelineIndex] ?? null;
   const selectedDateKey = useMemo(() => {
     if (!selectedIso) return null;
+    if (isWithinPastDay(selectedIso)) return dateKeyLocal(new Date());
     return dateKeyFromIso(selectedIso);
   }, [selectedIso]);
 
@@ -470,6 +471,13 @@ function dateKeyFromIso(iso: string): string | null {
   const d = new Date(iso);
   if (!Number.isFinite(d.getTime())) return null;
   return dateKeyLocal(d);
+}
+
+function isWithinPastDay(iso: string): boolean {
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return false;
+  const now = Date.now();
+  return t <= now && t >= now - 24 * 60 * 60 * 1000;
 }
 
 async function loadCalendarRowsForMonth(monthKey: string): Promise<Array<{ aqi: number | null; pm25: number | null; time: string }>> {

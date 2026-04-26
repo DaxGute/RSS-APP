@@ -18,6 +18,13 @@ type PanelSlot = 'bottom' | 'center';
 /** Lifts the selection sheet slightly above the screen edge / vertical center. */
 const PANEL_LIFT_PX = 15;
 
+function dateKeyLocal(date: Date): string {
+  const y = date.getFullYear();
+  const m = `${date.getMonth() + 1}`.padStart(2, '0');
+  const d = `${date.getDate()}`.padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
 export type SsfAirQualityScreenProps = {
   sensors: SensorPoint[];
   kriging: CurrentKrigingRow[];
@@ -59,24 +66,41 @@ export function SsfAirQualityScreen({
     () => timelineTimesAsc[timelineIndex] ?? (timelineTimesAsc.length === 0 ? new Date().toISOString() : null),
     [timelineIndex, timelineTimesAsc],
   );
-  const selectedTimeInPastDay = useMemo(() => {
-    if (!selectedTimeIsoForUi) return false;
+  const todayKey = useMemo(() => dateKeyLocal(new Date()), []);
+  const isSelectedDateToday = useMemo(() => {
+    if (!selectedTimeIsoForUi) return true;
     const selected = new Date(selectedTimeIsoForUi);
-    if (!Number.isFinite(selected.getTime())) return false;
-    const ageMs = Date.now() - selected.getTime();
-    return ageMs >= 0 && ageMs <= 24 * 60 * 60 * 1000;
-  }, [selectedTimeIsoForUi]);
-  const timelineTimesForUi = useMemo(
+    if (!Number.isFinite(selected.getTime())) return true;
+    return dateKeyLocal(selected) === todayKey;
+  }, [selectedTimeIsoForUi, todayKey]);
+  const todayTimelineTimesAsc = useMemo(() => {
+    return timelineTimesAsc.filter((iso) => {
+      const d = new Date(iso);
+      if (!Number.isFinite(d.getTime())) return false;
+      return dateKeyLocal(d) === todayKey;
+    });
+  }, [timelineTimesAsc, todayKey]);
+  const latestTodayRecordedTime = useMemo(
     () =>
-      timelineTimesAsc.length === 0 && selectedTimeInPastDay
-        ? [new Date().toISOString()]
-        : timelineTimesAsc,
-    [selectedTimeInPastDay, timelineTimesAsc],
+      todayTimelineTimesAsc[todayTimelineTimesAsc.length - 1] ??
+      timelineTimesAsc[timelineTimesAsc.length - 1] ??
+      null,
+    [todayTimelineTimesAsc, timelineTimesAsc],
   );
+  const timelineTimesForUi = useMemo(() => {
+    if (!selectedTimeIsoForUi) return todayTimelineTimesAsc;
+    if (!isSelectedDateToday) return [selectedTimeIsoForUi];
+    return todayTimelineTimesAsc.length > 0 ? todayTimelineTimesAsc : [selectedTimeIsoForUi];
+  }, [isSelectedDateToday, selectedTimeIsoForUi, todayTimelineTimesAsc]);
   const timelineIndexForUi = useMemo(
-    () =>
-      timelineTimesForUi.length > 0 ? Math.min(timelineIndex, timelineTimesForUi.length - 1) : 0,
-    [timelineIndex, timelineTimesForUi],
+    () => {
+      if (timelineTimesForUi.length === 0) return 0;
+      if (!selectedTimeIsoForUi) return Math.max(0, timelineTimesForUi.length - 1);
+      const indexInUi = timelineTimesForUi.findIndex((iso) => iso === selectedTimeIsoForUi);
+      if (indexInUi >= 0) return indexInUi;
+      return Math.max(0, timelineTimesForUi.length - 1);
+    },
+    [selectedTimeIsoForUi, timelineTimesForUi],
   );
 
   const { reminder, setReminder, clearReminder, isReminderForCoordinate } = useAirQualityReminder(
@@ -203,14 +227,18 @@ export function SsfAirQualityScreen({
             timesAsc={timelineTimesForUi}
             selectedIndex={timelineIndexForUi}
             onChangeIndex={(index) => {
-              if (timelineTimesAsc.length === 0) return;
-              onTimelineIndexChange(index);
+              if (!isSelectedDateToday) return;
+              const selectedIso = timelineTimesForUi[index];
+              if (!selectedIso) return;
+              const sourceIndex = timelineTimesAsc.findIndex((iso) => iso === selectedIso);
+              if (sourceIndex < 0) return;
+              onTimelineIndexChange(sourceIndex);
             }}
-            viewingLive={viewingLive}
-            showCurrentDayHistoryLabel={selectedTimeInPastDay}
             loading={timelineLoading}
             onPickRecordedTime={onSelectRecordedTime}
             liveAverageAqi={liveAverageAqi}
+            todayRecordedTime={latestTodayRecordedTime}
+            timelineScrollable={isSelectedDateToday}
           />
         </View>
       </View>

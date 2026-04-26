@@ -2,7 +2,7 @@
   "expo": {
     "name": "RSC-APP",
     "slug": "rss-app",
-    "version": "1.2.0",
+    "version": "1.2.1",
     "orientation": "portrait",
     "icon": "./assets/rise-south-city-logo.png",
     "userInterfaceStyle": "light",
