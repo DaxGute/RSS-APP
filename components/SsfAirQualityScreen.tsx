@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Image, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
@@ -23,6 +23,13 @@ function dateKeyLocal(date: Date): string {
   const m = `${date.getMonth() + 1}`.padStart(2, '0');
   const d = `${date.getDate()}`.padStart(2, '0');
   return `${y}-${m}-${d}`;
+}
+
+function isWithinPastDay(iso: string): boolean {
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return false;
+  const now = Date.now();
+  return t <= now && t >= now - 24 * 60 * 60 * 1000;
 }
 
 export type SsfAirQualityScreenProps = {
@@ -71,7 +78,7 @@ export function SsfAirQualityScreen({
     if (!selectedTimeIsoForUi) return true;
     const selected = new Date(selectedTimeIsoForUi);
     if (!Number.isFinite(selected.getTime())) return true;
-    return dateKeyLocal(selected) === todayKey;
+    return dateKeyLocal(selected) === todayKey || isWithinPastDay(selectedTimeIsoForUi);
   }, [selectedTimeIsoForUi, todayKey]);
   const todayTimelineTimesAsc = useMemo(() => {
     return timelineTimesAsc.filter((iso) => {
@@ -102,6 +109,21 @@ export function SsfAirQualityScreen({
     },
     [selectedTimeIsoForUi, timelineTimesForUi],
   );
+  const prevIsSelectedDateTodayRef = useRef(isSelectedDateToday);
+
+  useEffect(() => {
+    const wasToday = prevIsSelectedDateTodayRef.current;
+    if (!wasToday && isSelectedDateToday && timelineTimesAsc.length > 0) {
+      const latestTodayIso = todayTimelineTimesAsc[todayTimelineTimesAsc.length - 1];
+      if (latestTodayIso) {
+        const latestTodaySourceIndex = timelineTimesAsc.findIndex((iso) => iso === latestTodayIso);
+        if (latestTodaySourceIndex >= 0 && latestTodaySourceIndex !== timelineIndex) {
+          onTimelineIndexChange(latestTodaySourceIndex);
+        }
+      }
+    }
+    prevIsSelectedDateTodayRef.current = isSelectedDateToday;
+  }, [isSelectedDateToday, onTimelineIndexChange, timelineIndex, timelineTimesAsc, todayTimelineTimesAsc]);
 
   const { reminder, setReminder, clearReminder, isReminderForCoordinate } = useAirQualityReminder(
     sensors,
@@ -225,6 +247,7 @@ export function SsfAirQualityScreen({
 
           <ReadingTimeline
             timesAsc={timelineTimesForUi}
+            calendarTimesAsc={timelineTimesAsc}
             selectedIndex={timelineIndexForUi}
             onChangeIndex={(index) => {
               if (!isSelectedDateToday) return;

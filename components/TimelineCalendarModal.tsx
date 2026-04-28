@@ -84,6 +84,7 @@ export function TimelineCalendarModal({
   }, [activeMonthKey, currentMonthKey]);
 
   const activeMonthDays = useMemo(() => enumerateDaysInMonth(activeMonthKey), [activeMonthKey]);
+  const todayKey = useMemo(() => dateKeyLocal(new Date()), []);
   const activeMonthDayIndex = useMemo(() => {
     const out = new Map<string, number>();
     activeMonthDays.forEach((day, index) => out.set(day, index));
@@ -162,7 +163,8 @@ export function TimelineCalendarModal({
         continue;
       }
       const summary = effectiveDaySummaries.get(day);
-      const hasRecordedSnapshot = recordedTimeByDay.has(day);
+      const hasRecordedSnapshot = recordedTimeByDay.has(day) || timesByDay.has(day);
+      const canSelectDay = hasRecordedSnapshot || (day === todayKey && timelineTimesAsc.length > 0);
       const isSelected = day === selectedDateKey;
       const dayOpacity = opacityForDay(day);
       if (summary) {
@@ -184,7 +186,7 @@ export function TimelineCalendarModal({
             },
           },
         };
-      } else if (hasRecordedSnapshot) {
+      } else if (canSelectDay) {
         out[day] = {
           disabled: false,
           disableTouchEvent: false,
@@ -225,7 +227,17 @@ export function TimelineCalendarModal({
       }
     }
     return out;
-  }, [activeMonthKey, effectiveDaySummaries, maxDate, opacityForDay, recordedTimeByDay, selectedDateKey]);
+  }, [
+    activeMonthKey,
+    effectiveDaySummaries,
+    maxDate,
+    opacityForDay,
+    recordedTimeByDay,
+    selectedDateKey,
+    timelineTimesAsc.length,
+    timesByDay,
+    todayKey,
+  ]);
 
   useEffect(() => {
     if (!visible) return;
@@ -350,13 +362,34 @@ export function TimelineCalendarModal({
               onMonthChange={(m) => setVisibleMonth(`${m.year}-${`${m.month}`.padStart(2, '0')}`)}
               onDayPress={(day) => {
                 const dayKey = day.dateString;
-                const recordedTime =
-                  recordedTimeByDay.get(dayKey) ??
-                  (() => {
-                    const candidates = timesByDay.get(dayKey);
-                    if (!candidates || candidates.length === 0) return null;
-                    return timelineTimesAsc[candidates[candidates.length - 1]] ?? null;
-                  })();
+                if (dayKey === todayKey && timelineTimesAsc.length > 0) {
+                  const latestTimelineTime = timelineTimesAsc[timelineTimesAsc.length - 1] ?? null;
+                  if (latestTimelineTime) {
+                    onPickRecordedTime(latestTimelineTime);
+                    onClose();
+                  }
+                  return;
+                }
+                const recordedFromCalendar = recordedTimeByDay.get(dayKey) ?? null;
+                const recordedFromTimeline = (() => {
+                  const candidates = timesByDay.get(dayKey);
+                  if (!candidates || candidates.length === 0) return null;
+                  return timelineTimesAsc[candidates[candidates.length - 1]] ?? null;
+                })();
+                const recordedFromTodayFallback =
+                  dayKey === todayKey && timelineTimesAsc.length > 0
+                    ? timelineTimesAsc[timelineTimesAsc.length - 1] ?? null
+                    : null;
+                const recordedTime = (() => {
+                  if (recordedFromCalendar && recordedFromTimeline) {
+                    const calendarMs = new Date(recordedFromCalendar).getTime();
+                    const timelineMs = new Date(recordedFromTimeline).getTime();
+                    if (Number.isFinite(calendarMs) && Number.isFinite(timelineMs)) {
+                      return timelineMs >= calendarMs ? recordedFromTimeline : recordedFromCalendar;
+                    }
+                  }
+                  return recordedFromTimeline ?? recordedFromCalendar ?? recordedFromTodayFallback;
+                })();
                 if (!recordedTime) return;
                 onPickRecordedTime(recordedTime);
                 onClose();
@@ -393,7 +426,16 @@ function buildDaySummaries(
   for (const row of rows) {
     const dayKey = dateKeyFromIso(row.time);
     if (!dayKey) continue;
-    byDayRecordedTime.set(dayKey, row.time);
+    const previousRecordedTime = byDayRecordedTime.get(dayKey);
+    if (!previousRecordedTime) {
+      byDayRecordedTime.set(dayKey, row.time);
+    } else {
+      const prevMs = new Date(previousRecordedTime).getTime();
+      const nextMs = new Date(row.time).getTime();
+      if (Number.isFinite(nextMs) && (!Number.isFinite(prevMs) || nextMs > prevMs)) {
+        byDayRecordedTime.set(dayKey, row.time);
+      }
+    }
     const readingAqi = Number.isFinite(Number(row.aqi))
       ? Math.round(Number(row.aqi))
       : pm25ToAqi(row.pm25);

@@ -72,6 +72,7 @@ function polarToCartesian(angleDeg: number, radius: number) {
 
 export type ReadingTimelineProps = {
   timesAsc: string[];
+  calendarTimesAsc?: string[];
   selectedIndex: number;
   onChangeIndex: (index: number) => void;
   loading?: boolean;
@@ -83,6 +84,7 @@ export type ReadingTimelineProps = {
 
 export function ReadingTimeline({
   timesAsc,
+  calendarTimesAsc,
   selectedIndex,
   onChangeIndex,
   loading = false,
@@ -91,8 +93,10 @@ export function ReadingTimeline({
   todayRecordedTime = null,
   timelineScrollable = true,
 }: ReadingTimelineProps) {
+  const calendarTimes = calendarTimesAsc ?? timesAsc;
   const insets = useSafeAreaInsets();
   const calendarButtonScale = useRef(new Animated.Value(1)).current;
+  const timelineModeAnim = useRef(new Animated.Value(1)).current;
   const [calendarOpen, setCalendarOpen] = useState(false);
   const [dragProgress, setDragProgress] = useState<number | null>(null);
   const dragProgressRef = useRef<number | null>(null);
@@ -105,6 +109,19 @@ export function ReadingTimeline({
   const displayProgress = dragProgress ?? safeIndex;
 
   const selectedIso = timesAsc[Math.round(displayProgress)] ?? null;
+  const calendarIndex = useMemo(() => {
+    if (calendarTimes.length === 0) return 0;
+    if (!selectedIso) return Math.max(0, calendarTimes.length - 1);
+    const idx = calendarTimes.findIndex((iso) => iso === selectedIso);
+    if (idx >= 0) return idx;
+    return Math.max(0, calendarTimes.length - 1);
+  }, [calendarTimes, selectedIso]);
+  const isSelectedDateToday = useMemo(() => {
+    if (!selectedIso) return true;
+    const selectedDate = new Date(selectedIso);
+    if (!Number.isFinite(selectedDate.getTime())) return true;
+    return dateKeyLocal(selectedDate) === dateKeyLocal(new Date());
+  }, [selectedIso]);
   const showTodayButton = useMemo(() => {
     if (!onPickRecordedTime || !selectedIso) return false;
     const selectedDate = new Date(selectedIso);
@@ -114,6 +131,7 @@ export function ReadingTimeline({
   const dateButtonLabel = useMemo(() => formatDateButtonLabel(selectedIso), [selectedIso]);
 
   const arcLabels = useMemo(() => {
+    if (!isSelectedDateToday) return [];
     const out: Array<{ index: number; offsetFloat: number; angle: number; x: number; y: number; label: string }> = [];
     const centerIndex = Math.round(displayProgress);
     for (const offset of VISIBLE_OFFSETS) {
@@ -129,7 +147,7 @@ export function ReadingTimeline({
       out.push({ index, offsetFloat, angle, x: point.x, y: point.y, label });
     }
     return out;
-  }, [displayProgress, maxIdx, timesAsc]);
+  }, [displayProgress, isSelectedDateToday, maxIdx, timesAsc]);
 
   const arcMarkers = useMemo(() => {
     const markers: Array<{ id: string; x: number; y: number; active: boolean }> = [];
@@ -142,11 +160,11 @@ export function ReadingTimeline({
         id: `m-${i}`,
         x: p.x,
         y: p.y,
-        active: Math.abs(angle - selectedAngle) < 4,
+        active: isSelectedDateToday && Math.abs(angle - selectedAngle) < 4,
       });
     }
     return markers;
-  }, [displayProgress, maxIdx]);
+  }, [displayProgress, isSelectedDateToday, maxIdx]);
 
   useEffect(() => {
     dragProgressRef.current = dragProgress;
@@ -160,6 +178,14 @@ export function ReadingTimeline({
       }
     };
   }, []);
+
+  useEffect(() => {
+    Animated.timing(timelineModeAnim, {
+      toValue: isSelectedDateToday ? 1 : 0,
+      duration: 180,
+      useNativeDriver: true,
+    }).start();
+  }, [isSelectedDateToday, timelineModeAnim]);
 
   const openCalendar = useCallback(() => {
     if (!onPickRecordedTime) return;
@@ -323,27 +349,47 @@ export function ReadingTimeline({
                 if (Math.abs(slot.offsetFloat) > 1.1) return;
                 onChangeIndex(slot.index);
               }}
-              style={[
-                styles.arcLabelSlot,
-                {
-                  left: slot.x - 30,
-                  top: slot.y - 12,
-                  opacity: Math.max(0, 1 - Math.abs(slot.offsetFloat) * 0.32),
-                  transform: [
-                    { rotate: `${slot.angle - 45}deg` },
-                    {
-                      scale:
-                        Math.abs(slot.offsetFloat) < 0.18
-                          ? 1.18
-                          : Math.max(0.72, 1 - Math.abs(slot.offsetFloat) * 0.12),
-                    },
-                  ],
-                },
-              ]}
+              style={({ pressed }) => {
+                const baseScale =
+                  Math.abs(slot.offsetFloat) < 0.18
+                    ? 1.18
+                    : Math.max(0.72, 1 - Math.abs(slot.offsetFloat) * 0.12);
+                return [
+                  styles.arcLabelSlot,
+                  {
+                    left: slot.x - 30,
+                    top: slot.y - 12,
+                    opacity: Math.max(0, 1 - Math.abs(slot.offsetFloat) * 0.32) * (pressed ? 0.86 : 1),
+                    transform: [{ rotate: `${slot.angle - 45}deg` }, { scale: baseScale }],
+                  },
+                ];
+              }}
             >
-              <Text style={styles.dialText} numberOfLines={1}>
+              <Animated.Text
+                style={[
+                  styles.dialText,
+                  {
+                    opacity: timelineModeAnim,
+                    transform: [
+                      {
+                        translateY: timelineModeAnim.interpolate({
+                          inputRange: [0, 1],
+                          outputRange: [3, 0],
+                        }),
+                      },
+                      {
+                        scale: timelineModeAnim.interpolate({
+                          inputRange: [0, 1],
+                          outputRange: [0.96, 1],
+                        }),
+                      },
+                    ],
+                  },
+                ]}
+                numberOfLines={1}
+              >
                 {slot.label}
-              </Text>
+              </Animated.Text>
             </Pressable>
           ))}
         </View>
@@ -352,8 +398,8 @@ export function ReadingTimeline({
         <TimelineCalendarModal
           visible={calendarOpen}
           onClose={closeCalendar}
-          timelineTimesAsc={timesAsc}
-          timelineIndex={safeIndex}
+          timelineTimesAsc={calendarTimes}
+          timelineIndex={calendarIndex}
           onPickRecordedTime={onPickRecordedTime}
           liveAverageAqi={liveAverageAqi}
         />
