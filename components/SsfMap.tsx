@@ -1,7 +1,8 @@
-import { useCallback, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import Mapbox from '@rnmapbox/maps';
 import type { FeatureCollection, Point } from 'geojson';
-import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { Animated, Pressable, StyleSheet, View } from 'react-native';
+import Svg, { Circle, Path } from 'react-native-svg';
 
 import type { CurrentKrigingRow } from '../lib/database.types';
 import { SSF_BBOX } from '../lib/constants/ssf';
@@ -12,6 +13,8 @@ import { KrigingHeatmapLayer } from './KrigingHeatmapLayer';
 
 export type MapSelectDetail = {
   touchInBottomBand: boolean;
+  screenPointX?: number | null;
+  screenPointY?: number | null;
   sensorIndex?: number;
   sensorSource?: string;
   sensorName?: string | null;
@@ -25,6 +28,9 @@ export type SsfMapProps = {
   /** Saved reminder pin (same coords as global reminder in the panel). */
   reminderLocation?: { latitude: number; longitude: number } | null;
   onSelectCoordinate: (lat: number, lon: number, detail: MapSelectDetail) => void;
+  selectedCallout?: ReactNode;
+  selectedCalloutPlacement?: 'above' | 'below';
+  selectedCalloutShiftX?: number;
 };
 
 const mapboxToken = process.env.EXPO_PUBLIC_MAPBOX_TOKEN;
@@ -37,6 +43,23 @@ const MIN_ZOOM_FACTOR = 0.5;
 const MAX_ZOOM_FACTOR = 3;
 const MIN_ZOOM_LEVEL = DEFAULT_ZOOM_LEVEL * MIN_ZOOM_FACTOR;
 const MAX_ZOOM_LEVEL = DEFAULT_ZOOM_LEVEL * MAX_ZOOM_FACTOR;
+const REMINDER_BELL_PATH =
+  'M42.2174 32.922V21.7756C42.2174 20.4935 42.0235 19.2188 41.6423 17.9946C37.9321 6.07937 21.0679 6.07937 17.3577 17.9946C16.9765 19.2188 16.7826 20.4935 16.7826 21.7756V32.922C16.7826 34.01 16.3743 35.0585 15.6383 35.8599L11.5394 40.3236C10.9506 40.9648 11.4054 42 12.2759 42H46.7241C47.5946 42 48.0494 40.9648 47.4606 40.3236L43.3617 35.8599C42.6257 35.0585 42.2174 34.01 42.2174 32.922Z';
+
+function ReminderBellIcon() {
+  return (
+    <Svg width={30} height={30} viewBox="0 0 60 60">
+      <Circle cx={29.5} cy={45.5} r={6.5} fill="#F66D1E" stroke="#AA2C1E" strokeWidth={4} />
+      <Path
+        d={REMINDER_BELL_PATH}
+        fill="#F66D1E"
+        stroke="#AA2C1E"
+        strokeWidth={4}
+        strokeLinejoin="round"
+      />
+    </Svg>
+  );
+}
 
 export function SsfMap({
   sensors,
@@ -45,9 +68,21 @@ export function SsfMap({
   selected,
   reminderLocation = null,
   onSelectCoordinate,
+  selectedCallout = null,
+  selectedCalloutPlacement = 'above',
+  selectedCalloutShiftX = 0,
 }: SsfMapProps) {
   const wrapRef = useRef<View>(null);
   const lastSensorTapMsRef = useRef(0);
+  const calloutScale = useRef(new Animated.Value(0.92)).current;
+  const calloutOpacity = useRef(new Animated.Value(0)).current;
+  const [animatedSelected, setAnimatedSelected] = useState(selected);
+  const [animatedCallout, setAnimatedCallout] = useState<ReactNode>(selectedCallout);
+  const [animatedPlacement, setAnimatedPlacement] = useState<'above' | 'below'>(selectedCalloutPlacement);
+  const [animatedShiftX, setAnimatedShiftX] = useState(selectedCalloutShiftX);
+  const prevSelectedCoordKeyRef = useRef<string | null>(
+    selected ? `${selected.latitude.toFixed(6)}:${selected.longitude.toFixed(6)}` : null,
+  );
 
   const sensorGeoJson = useMemo(() => {
     const shape: FeatureCollection<
@@ -97,11 +132,17 @@ export function SsfMap({
     (
       lat: number,
       lon: number,
+      pageX: number | null,
       pageY: number | null,
       sensorDetail?: { sensorIndex?: number; sensorSource?: string; sensorName?: string | null },
     ) => {
       const finish = (touchInBottomBand: boolean) => {
-        onSelectCoordinate(lat, lon, { touchInBottomBand, ...sensorDetail });
+        onSelectCoordinate(lat, lon, {
+          touchInBottomBand,
+          screenPointX: pageX,
+          screenPointY: pageY,
+          ...sensorDetail,
+        });
       };
 
       const wrap = wrapRef.current;
@@ -124,8 +165,9 @@ export function SsfMap({
       const coords = event?.geometry?.coordinates;
       if (!Array.isArray(coords) || coords.length < 2) return;
       const [lon, lat] = coords;
+      const maybePageX = (event?.properties as { screenPointX?: number } | undefined)?.screenPointX ?? null;
       const maybePageY = (event?.properties as { screenPointY?: number } | undefined)?.screenPointY ?? null;
-      handlePress(lat, lon, maybePageY);
+      handlePress(lat, lon, maybePageX, maybePageY);
     },
     [handlePress],
   );
@@ -149,8 +191,10 @@ export function SsfMap({
         typeof feature?.properties?.name === 'string' ? feature.properties.name : null;
       const maybePageY =
         (event as unknown as { properties?: { screenPointY?: number } }).properties?.screenPointY ?? null;
+      const maybePageX =
+        (event as unknown as { properties?: { screenPointX?: number } }).properties?.screenPointX ?? null;
       lastSensorTapMsRef.current = Date.now();
-      handlePress(lat, lon, maybePageY, {
+      handlePress(lat, lon, maybePageX, maybePageY, {
         sensorIndex: Number.isFinite(sensorIndex) ? sensorIndex : undefined,
         sensorSource,
         sensorName,
@@ -161,8 +205,83 @@ export function SsfMap({
 
   const handleReminderPress = useCallback(() => {
     if (!reminderLocation) return;
-    handlePress(reminderLocation.latitude, reminderLocation.longitude, null);
+    handlePress(reminderLocation.latitude, reminderLocation.longitude, null, null);
   }, [handlePress, reminderLocation]);
+
+  useEffect(() => {
+    const selectedCoordKey = selected
+      ? `${selected.latitude.toFixed(6)}:${selected.longitude.toFixed(6)}`
+      : null;
+    const didOpen = prevSelectedCoordKeyRef.current == null && selectedCoordKey != null;
+    const didClose = prevSelectedCoordKeyRef.current != null && selectedCoordKey == null;
+    const didMove =
+      prevSelectedCoordKeyRef.current != null &&
+      selectedCoordKey != null &&
+      prevSelectedCoordKeyRef.current !== selectedCoordKey;
+    prevSelectedCoordKeyRef.current = selectedCoordKey;
+
+    if (selected) {
+      setAnimatedSelected(selected);
+      setAnimatedCallout(selectedCallout);
+      setAnimatedPlacement(selectedCalloutPlacement);
+      setAnimatedShiftX(selectedCalloutShiftX);
+      if (didOpen || didMove) {
+        calloutScale.stopAnimation();
+        calloutOpacity.stopAnimation();
+        calloutScale.setValue(0.92);
+        calloutOpacity.setValue(0);
+        Animated.parallel([
+          Animated.spring(calloutScale, {
+            toValue: 1,
+            stiffness: 220,
+            damping: 16,
+            mass: 0.7,
+            useNativeDriver: true,
+          }),
+          Animated.timing(calloutOpacity, {
+            toValue: 1,
+            duration: 180,
+            useNativeDriver: true,
+          }),
+        ]).start();
+      } else {
+        calloutScale.setValue(1);
+        calloutOpacity.setValue(1);
+      }
+      return;
+    }
+    if (!didClose || !animatedSelected) return;
+    calloutScale.stopAnimation();
+    calloutOpacity.stopAnimation();
+    Animated.parallel([
+      Animated.timing(calloutScale, {
+        toValue: 0.94,
+        duration: 140,
+        useNativeDriver: true,
+      }),
+      Animated.timing(calloutOpacity, {
+        toValue: 0,
+        duration: 120,
+        useNativeDriver: true,
+      }),
+    ]).start(({ finished }) => {
+      if (!finished) return;
+      setAnimatedSelected(null);
+      setAnimatedCallout(null);
+    });
+  }, [
+    animatedSelected,
+    calloutOpacity,
+    calloutScale,
+    selected,
+  ]);
+
+  useEffect(() => {
+    if (!selected) return;
+    setAnimatedCallout(selectedCallout);
+    setAnimatedPlacement(selectedCalloutPlacement);
+    setAnimatedShiftX(selectedCalloutShiftX);
+  }, [selected, selectedCallout, selectedCalloutPlacement, selectedCalloutShiftX]);
 
   return (
     <View ref={wrapRef} style={styles.wrap}>
@@ -214,6 +333,31 @@ export function SsfMap({
             />
           </Mapbox.ShapeSource>
         ) : null}
+        {animatedSelected && animatedCallout ? (
+          <Mapbox.MarkerView
+            id="selected-callout"
+            coordinate={[animatedSelected.longitude, animatedSelected.latitude]}
+            anchor={{ x: 0.5, y: animatedPlacement === 'above' ? 1 : 0 }}
+          >
+            <Animated.View
+              style={[
+                styles.calloutWrap,
+                animatedPlacement === 'above' ? styles.calloutWrapAbove : styles.calloutWrapBelow,
+                {
+                  opacity: calloutOpacity,
+                  transform: [{ scale: calloutScale }],
+                },
+              ]}
+              pointerEvents="box-none"
+            >
+              {animatedPlacement === 'below' ? <View style={styles.calloutArrowUp} /> : null}
+              <View style={[styles.calloutCard, { transform: [{ translateX: animatedShiftX }] }]}>
+                {animatedCallout}
+              </View>
+              {animatedPlacement === 'above' ? <View style={styles.calloutArrowDown} /> : null}
+            </Animated.View>
+          </Mapbox.MarkerView>
+        ) : null}
 
         {reminderLocation ? (
           <Mapbox.PointAnnotation
@@ -222,7 +366,7 @@ export function SsfMap({
             onSelected={handleReminderPress}
           >
             <Pressable onPress={handleReminderPress} hitSlop={14} style={styles.reminderIconWrap}>
-              <Text style={styles.reminderIcon}>🔔</Text>
+              <ReminderBellIcon />
             </Pressable>
           </Mapbox.PointAnnotation>
         ) : null}
@@ -237,14 +381,42 @@ const styles = StyleSheet.create({
   reminderIconWrap: {
     alignItems: 'center',
     justifyContent: 'center',
-    paddingHorizontal: 4,
-    paddingVertical: 2,
+    padding: 2,
   },
-  reminderIcon: {
-    fontSize: 24,
-    lineHeight: 26,
-    textShadowColor: 'rgba(15, 23, 42, 0.9)',
-    textShadowOffset: { width: 0, height: 1 },
-    textShadowRadius: 3,
+  calloutWrap: {
+    alignItems: 'center',
+  },
+  calloutWrapAbove: {
+    marginBottom: 18,
+  },
+  calloutWrapBelow: {
+    marginTop: 18,
+  },
+  calloutCard: {
+    width: 300,
+    borderRadius: 14,
+    overflow: 'hidden',
+  },
+  calloutArrowDown: {
+    marginTop: -1,
+    width: 0,
+    height: 0,
+    borderLeftWidth: 8,
+    borderRightWidth: 8,
+    borderTopWidth: 10,
+    borderLeftColor: 'transparent',
+    borderRightColor: 'transparent',
+    borderTopColor: 'rgba(255,255,255,0.92)',
+  },
+  calloutArrowUp: {
+    marginBottom: -1,
+    width: 0,
+    height: 0,
+    borderLeftWidth: 8,
+    borderRightWidth: 8,
+    borderBottomWidth: 10,
+    borderLeftColor: 'transparent',
+    borderRightColor: 'transparent',
+    borderBottomColor: 'rgba(255,255,255,0.92)',
   },
 });

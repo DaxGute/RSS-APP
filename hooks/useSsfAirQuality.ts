@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { POLL_INTERVAL_MS } from '../lib/constants/ssf';
 import type { ClarityRow, CurrentKrigingRow, DailySensorAqiRow, PurpleAirRow } from '../lib/database.types';
+import { pm25ToAqi } from '../lib/aqiUtils';
 import {
   fetchDistinctPipelineTimes,
   fetchDailySensorAqiAtRecordedTime,
@@ -39,6 +40,7 @@ export type SsfAirQualityState = {
   timelineLoading: boolean;
   insufficientData: boolean;
   liveAverageAqi: number | null;
+  averageAqiTimeseries: Array<{ time: string; avgAqi: number }>;
 };
 
 function toSensorPoints(
@@ -128,6 +130,28 @@ function mergeTimesAsc(prev: string[], additions: readonly string[]): string[] {
   return Array.from(s).sort((a, b) => new Date(a).getTime() - new Date(b).getTime());
 }
 
+function buildAverageAqiTimeseries(
+  purple: PurpleAirRow[] | null,
+  clarity: ClarityRow[] | null,
+): Array<{ time: string; avgAqi: number }> {
+  const sums = new Map<string, { total: number; count: number }>();
+  const addRow = (time: string | null | undefined, pm25: number | null | undefined) => {
+    if (!time || pm25 == null || !Number.isFinite(pm25)) return;
+    const aqi = pm25ToAqi(pm25);
+    if (aqi == null || !Number.isFinite(aqi)) return;
+    const curr = sums.get(time) ?? { total: 0, count: 0 };
+    curr.total += aqi;
+    curr.count += 1;
+    sums.set(time, curr);
+  };
+  for (const row of purple ?? []) addRow(row.time, row.pm25);
+  for (const row of clarity ?? []) addRow(row.time, row.pm25);
+  return Array.from(sums.entries())
+    .map(([time, v]) => ({ time, avgAqi: v.count > 0 ? v.total / v.count : 0 }))
+    .filter((r) => Number.isFinite(new Date(r.time).getTime()))
+    .sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
+}
+
 function trimTimesToRollingDay(timesAsc: string[], preserveIso?: string | null): string[] {
   const now = Date.now();
   const floor = now - TIMELINE_HOURS_BACK * 60 * 60 * 1000;
@@ -203,9 +227,7 @@ export function useSsfAirQuality(): SsfAirQualityState & { refresh: () => Promis
     let cancelled = false;
     void (async () => {
       const now = new Date();
-      const dayStart = new Date(now);
-      dayStart.setHours(0, 0, 0, 0);
-      const fromIso = dayStart.toISOString();
+      const fromIso = new Date(now.getTime() - TIMELINE_HOURS_BACK * 60 * 60 * 1000).toISOString();
       const toIso = now.toISOString();
       const dayRes = await fetchDailySensorAqiBetweenRecordedTimes(fromIso, toIso);
       if (cancelled || !mounted.current || dayRes.error || !dayRes.data || dayRes.data.length === 0) return;
@@ -244,9 +266,7 @@ export function useSsfAirQuality(): SsfAirQualityState & { refresh: () => Promis
     setInitialLoadProgress(0.05);
     try {
       const now = new Date();
-      const dayStart = new Date(now);
-      dayStart.setHours(0, 0, 0, 0);
-      const fromIso = dayStart.toISOString();
+      const fromIso = new Date(now.getTime() - TIMELINE_HOURS_BACK * 60 * 60 * 1000).toISOString();
       const toIso = now.toISOString();
       const sensorsRes = await fetchSensorReadingsBetweenRecordedTimes(fromIso, toIso);
       if (!mounted.current) return;
@@ -418,6 +438,10 @@ export function useSsfAirQuality(): SsfAirQualityState & { refresh: () => Promis
     if (c > 500.4) return 500;
     return null;
   }, [sensors]);
+  const averageAqiTimeseries = useMemo(
+    () => buildAverageAqiTimeseries(purpleAir, clarity),
+    [clarity, purpleAir],
+  );
 
   useEffect(() => {
     // Bootstrap the app with full latest sensor snapshots first.
@@ -444,6 +468,7 @@ export function useSsfAirQuality(): SsfAirQualityState & { refresh: () => Promis
     timelineLoading,
     insufficientData,
     liveAverageAqi,
+    averageAqiTimeseries,
     refresh: loadSensors,
   };
 }

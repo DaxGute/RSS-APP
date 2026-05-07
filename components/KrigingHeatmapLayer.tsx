@@ -109,54 +109,34 @@ export function KrigingHeatmapLayer({ kriging, mapRegion, sensors }: KrigingHeat
       const shape: FeatureCollection<MultiPolygon, { bin: number; color: string; level: number }> = {
         type: 'FeatureCollection',
         features: [
-          // Base band: fill the full interpolation bbox with the "good" AQI color,
-          // then contour overlays paint higher categories on top.
-          {
-            type: 'Feature',
-            id: 'kband-base',
-            geometry: {
-              type: 'MultiPolygon',
-              coordinates: [[[
-                [minLon, minLat],
-                [maxLon, minLat],
-                [maxLon, maxLat],
-                [minLon, maxLat],
-                [minLon, minLat],
-              ]]],
-            },
-            properties: {
-              bin: 0,
-              color: BIN_COLORS[0],
-              level: 0,
-            },
-          },
+          // No base fill for "good" AQI (green): leave the map visible there; contours handle higher bins only.
           ...contourFeatures.map((feature: ContourMultiPolygon, idx: number) => {
-          const level = Number(feature.value);
-          // Category contours at 0.5, 1.5, ... represent areas where bin index >= 1, >= 2, ...
-          const safeBin = clamp(Math.round(level + 0.5), 1, BIN_COLORS.length - 1);
-          const projected = feature.coordinates.map((poly: number[][][]) =>
-            poly.map((ring: number[][]) =>
-              ring.map(([x, y]: number[]) => {
-                const lon = minLon + (x / (n - 1)) * (maxLon - minLon);
-                const lat = maxLat - (y / (m - 1)) * (maxLat - minLat);
-                return [lon, lat] as [number, number];
-              }),
-            ),
-          );
-          return {
-            type: 'Feature' as const,
-            id: `kband-${idx}`,
-            geometry: {
-              type: 'MultiPolygon' as const,
-              coordinates: projected,
-            },
-            properties: {
-              bin: safeBin,
-              color: BIN_COLORS[safeBin],
-              level,
-            },
-          };
-        }),
+            const level = Number(feature.value);
+            // Category contours at 0.5, 1.5, ... represent areas where bin index >= 1, >= 2, ...
+            const safeBin = clamp(Math.round(level + 0.5), 1, BIN_COLORS.length - 1);
+            const projected = feature.coordinates.map((poly: number[][][]) =>
+              poly.map((ring: number[][]) =>
+                ring.map(([x, y]: number[]) => {
+                  const lon = minLon + (x / (n - 1)) * (maxLon - minLon);
+                  const lat = maxLat - (y / (m - 1)) * (maxLat - minLat);
+                  return [lon, lat] as [number, number];
+                }),
+              ),
+            );
+            return {
+              type: 'Feature' as const,
+              id: `kband-${idx}`,
+              geometry: {
+                type: 'MultiPolygon' as const,
+                coordinates: projected,
+              },
+              properties: {
+                bin: safeBin,
+                color: BIN_COLORS[safeBin],
+                level,
+              },
+            };
+          }),
         ],
       };
       return shape;

@@ -209,12 +209,12 @@ export async function fetchDailySensorAqiCalendarRows(): Promise<{
   const { data, error } = await supabase
     .from('daily_sensor_aqi')
     .select('time,aqi,pm25')
-    .order('time', { ascending: true })
+    .order('time', { ascending: false })
     .limit(50_000);
   if (error) {
     return { data: null, error: mapError(error) };
   }
-  return { data: (data ?? []) as DailySensorAqiRow[], error: null };
+  return { data: ((data ?? []) as DailySensorAqiRow[]).reverse(), error: null };
 }
 
 export async function fetchDailySensorAqiCalendarRowsForMonth(

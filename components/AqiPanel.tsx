@@ -338,6 +338,8 @@ export type AqiPanelProps = {
    * no internal scroll — height follows content.
    */
   sheetMode?: boolean;
+  /** Full-width docked sheet variant: opaque with square bottom corners. */
+  sheetDocked?: boolean;
   /** EPA band index 0–5; when true, the bell uses the filled style for this map selection. */
   reminderBellActive?: boolean;
   /** If provided, a bell appears (when the panel has a valid estimate) to set a single global reminder. */
@@ -370,6 +372,7 @@ export function AqiPanel({
   mapRegion,
   onClose,
   sheetMode = false,
+  sheetDocked = false,
   reminderBellActive = false,
   onReminderPickThreshold,
   onReminderCooldownChange,
@@ -503,12 +506,13 @@ export function AqiPanel({
 
   return (
     <LinearGradient
-      colors={['rgba(255,255,255,0.92)', 'rgba(255,255,255,0.78)']}
+      colors={sheetDocked ? ['#ffffff', '#ffffff'] : ['rgba(255,255,255,0.92)', 'rgba(255,255,255,0.78)']}
       style={[
         styles.shellOuter,
         compact && styles.shellOuterCompact,
         onClose == null && styles.shellOuterInline,
         compact && styles.shellOuterSheetFlex,
+        sheetDocked && styles.shellOuterDocked,
       ]}
     >
       <View style={[styles.shell, compact && styles.shellSheetFlex]}>
@@ -758,7 +762,7 @@ export function AqiPanel({
                           : `${panel.closest.pm25.toFixed(1)} µg/m³`
                         : '—'
                     }
-                    sub="Nearest observed sensor reading"
+                    sub="Nearest observed sensor"
                     valueFontSize={cardValueSize}
                   />
                   <MiniCard
@@ -1007,6 +1011,28 @@ function CompactPanelBody({
         <Text style={styles.compactCoords} numberOfLines={1}>
           {ph ? '-, -.' : selectedLabel ?? `${panel.lat.toFixed(5)}, ${panel.lon.toFixed(5)}`}
         </Text>
+        <View style={styles.compactToggleInHeader}>
+          <View style={styles.metricToggleCompact}>
+            <Pressable
+              onPress={() => setMetric('pm25')}
+              style={[styles.metricPillCompact, metric === 'pm25' && styles.metricPillActive]}
+            >
+              <Text
+                style={[styles.metricPillTextCompact, metric === 'pm25' && styles.metricPillTextActive]}
+              >
+                PM2.5
+              </Text>
+            </Pressable>
+            <Pressable
+              onPress={() => setMetric('aqi')}
+              style={[styles.metricPillCompact, metric === 'aqi' && styles.metricPillActive]}
+            >
+              <Text style={[styles.metricPillTextCompact, metric === 'aqi' && styles.metricPillTextActive]}>
+                AQI
+              </Text>
+            </Pressable>
+          </View>
+        </View>
       </View>
 
       <LinearGradient
@@ -1046,28 +1072,6 @@ function CompactPanelBody({
             </View>
           </View>
         </View>
-        <View style={styles.compactToggle}>
-          <View style={styles.metricToggleCompact}>
-            <Pressable
-              onPress={() => setMetric('pm25')}
-              style={[styles.metricPillCompact, metric === 'pm25' && styles.metricPillActive]}
-            >
-              <Text
-                style={[styles.metricPillTextCompact, metric === 'pm25' && styles.metricPillTextActive]}
-              >
-                PM2.5
-              </Text>
-            </Pressable>
-            <Pressable
-              onPress={() => setMetric('aqi')}
-              style={[styles.metricPillCompact, metric === 'aqi' && styles.metricPillActive]}
-            >
-              <Text style={[styles.metricPillTextCompact, metric === 'aqi' && styles.metricPillTextActive]}>
-                AQI
-              </Text>
-            </Pressable>
-          </View>
-        </View>
       </LinearGradient>
 
       {ph || okPanel ? (
@@ -1083,7 +1087,7 @@ function CompactPanelBody({
                     : `${panel.closest.pm25.toFixed(1)} µg/m³`
                   : '—'
             }
-            sub={ph ? 'Click the map to see the nearest sensor' : 'Nearest observed sensor reading'}
+            sub={ph ? 'Click the map to see the nearest sensor' : 'Nearest observed sensor'}
             valueFontSize={cardValueSize}
             compact
           />
@@ -1361,6 +1365,11 @@ const styles = StyleSheet.create({
   },
   shellOuterSheetFlex: {
     alignSelf: 'stretch',
+  },
+  shellOuterDocked: {
+    borderBottomLeftRadius: 0,
+    borderBottomRightRadius: 0,
+    borderColor: 'rgba(15,23,42,0.08)',
   },
   shellSheetFlex: {
     minWidth: 0,
@@ -1671,8 +1680,13 @@ const styles = StyleSheet.create({
     fontVariant: ['tabular-nums'],
   },
   compactCoordsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
     marginBottom: 6,
   },
+  compactToggleInHeader: { flexShrink: 0 },
   compactCoords: {
     fontSize: 10,
     fontWeight: '700',
@@ -1747,7 +1761,6 @@ const styles = StyleSheet.create({
     maxWidth: '100%',
   },
   compactBadgeText: { fontSize: 10, fontWeight: '800', color: '#0f172a' },
-  compactToggle: { flexShrink: 0 },
   metricToggleCompact: {
     flexDirection: 'row',
     gap: 4,
