@@ -1,17 +1,40 @@
+import { ROLLING_24H_TIME_WINDOW_BUFFER_MS } from './constants/ssf';
 import { supabase } from './supabase';
 
 import type { ClarityRow, CurrentKrigingRow, DailySensorAqiRow, PurpleAirRow } from './database.types';
 
 export type FetchError = { message: string; details?: string };
 
+/**
+ * PostgREST `max-rows` default on Supabase is 1000. If you request a larger
+ * `.range()`, the server still returns at most this many rows — so comparing
+ * `batch.length` to a bigger "page size" stops pagination after the first batch.
+ */
+const POSTGREST_MAX_ROWS_PER_REQUEST = 1000;
+
 /** Cap when selecting all sensors for one pipeline `time` (many rows). */
 const SNAPSHOT_ROW_CAP = 50_000;
 
 /**
+ * Paginated range reads load every row in `[from, to]` until a short page; this
+ * ceiling only guards pathological tables (memory / request storms).
+ */
+const SENSOR_RANGE_HARD_MAX = 2_000_000;
+
+/**
+ * Must stay at or below PostgREST `max-rows` for the project (Supabase default 1000).
+ */
+const SENSOR_RANGE_PAGE_SIZE = POSTGREST_MAX_ROWS_PER_REQUEST;
+
+/** Scanning `time` (+ tie-breaker) for distinct pipeline stamps. */
+const PIPELINE_TIME_PAGE_SIZE = POSTGREST_MAX_ROWS_PER_REQUEST;
+const PIPELINE_TIME_SCAN_HARD_MAX = 2_000_000;
+
+/**
  * PostgREST defaults to 1000 rows per request; paginate to load the full kriging grid (~10k+ cells).
  */
-const KRIGING_PAGE_SIZE = 5000;
-const KRIGING_MAX_PAGES = 200;
+const KRIGING_RANGE_PAGE = POSTGREST_MAX_ROWS_PER_REQUEST;
+const KRIGING_MAX_TOTAL_ROWS = 1_000_000;
 const SENSOR_COLUMNS = 'sensor_index,name,latitude,longitude,pm25,time';
 // Map DB `variance` -> app field `kriging_variance`.
 const KRIGING_COLUMNS = 'latitude,longitude,pm25,aqi,kriging_variance:variance,time';
@@ -49,11 +72,12 @@ function applySensorTimeFilters<T extends { gte: Function; lte: Function; eq: Fu
   let q = query;
   if (options?.atRecordedTime) {
     q = q.eq('time', options.atRecordedTime);
+    q = q.order('sensor_index', { ascending: true });
   } else {
     if (options?.fromRecordedTime) q = q.gte('time', options.fromRecordedTime);
     if (options?.toRecordedTime) q = q.lte('time', options.toRecordedTime);
+    q = q.order('time', { ascending: false });
   }
-  q = q.order('time', { ascending: false });
   if (options?.atRecordedTime) {
     q = q.limit(SNAPSHOT_ROW_CAP);
   } else {
@@ -110,6 +134,128 @@ export async function getLatestRecordedTimes(): Promise<{
   };
 }
 
+async function fetchPurpleAirReadingsBetweenPaginated(
+  fromRecordedTime: string,
+  toRecordedTime: string,
+): Promise<{ data: PurpleAirRow[] | null; error: FetchError | null }> {
+  const rows: PurpleAirRow[] = [];
+  let offset = 0;
+  while (rows.length < SENSOR_RANGE_HARD_MAX) {
+    const end = offset + SENSOR_RANGE_PAGE_SIZE - 1;
+    const { data, error } = await supabase
+      .from('purple_air')
+      .select(SENSOR_COLUMNS)
+      .gte('time', fromRecordedTime)
+      .lte('time', toRecordedTime)
+      .order('time', { ascending: true })
+      .order('sensor_index', { ascending: true })
+      .range(offset, end);
+    if (error) {
+      return { data: null, error: mapError(error) };
+    }
+    const batch = (data ?? []) as PurpleAirRow[];
+    if (batch.length === 0) break;
+    for (const r of batch) {
+      rows.push(r);
+      if (rows.length >= SENSOR_RANGE_HARD_MAX) break;
+    }
+    if (rows.length >= SENSOR_RANGE_HARD_MAX) break;
+    offset += batch.length;
+    if (batch.length < SENSOR_RANGE_PAGE_SIZE) break;
+  }
+  return { data: rows, error: null };
+}
+
+async function fetchClarityReadingsBetweenPaginated(
+  fromRecordedTime: string,
+  toRecordedTime: string,
+): Promise<{ data: ClarityRow[] | null; error: FetchError | null }> {
+  const rows: ClarityRow[] = [];
+  let offset = 0;
+  while (rows.length < SENSOR_RANGE_HARD_MAX) {
+    const end = offset + SENSOR_RANGE_PAGE_SIZE - 1;
+    const { data, error } = await supabase
+      .from('clarity')
+      .select(SENSOR_COLUMNS)
+      .gte('time', fromRecordedTime)
+      .lte('time', toRecordedTime)
+      .order('time', { ascending: true })
+      .order('sensor_index', { ascending: true })
+      .range(offset, end);
+    if (error) {
+      return { data: null, error: mapError(error) };
+    }
+    const batch = (data ?? []) as ClarityRow[];
+    if (batch.length === 0) break;
+    for (const r of batch) {
+      rows.push(r);
+      if (rows.length >= SENSOR_RANGE_HARD_MAX) break;
+    }
+    if (rows.length >= SENSOR_RANGE_HARD_MAX) break;
+    offset += batch.length;
+    if (batch.length < SENSOR_RANGE_PAGE_SIZE) break;
+  }
+  return { data: rows, error: null };
+}
+
+async function fetchPurpleAirAtRecordedTimePaginated(
+  recordedTime: string,
+): Promise<{ data: PurpleAirRow[] | null; error: FetchError | null }> {
+  const rows: PurpleAirRow[] = [];
+  let offset = 0;
+  while (rows.length < SNAPSHOT_ROW_CAP) {
+    const end = offset + SENSOR_RANGE_PAGE_SIZE - 1;
+    const { data, error } = await supabase
+      .from('purple_air')
+      .select(SENSOR_COLUMNS)
+      .eq('time', recordedTime)
+      .order('sensor_index', { ascending: true })
+      .range(offset, end);
+    if (error) {
+      return { data: null, error: mapError(error) };
+    }
+    const batch = (data ?? []) as PurpleAirRow[];
+    if (batch.length === 0) break;
+    for (const r of batch) {
+      rows.push(r);
+      if (rows.length >= SNAPSHOT_ROW_CAP) break;
+    }
+    if (rows.length >= SNAPSHOT_ROW_CAP) break;
+    offset += batch.length;
+    if (batch.length < SENSOR_RANGE_PAGE_SIZE) break;
+  }
+  return { data: rows, error: null };
+}
+
+async function fetchClarityAtRecordedTimePaginated(
+  recordedTime: string,
+): Promise<{ data: ClarityRow[] | null; error: FetchError | null }> {
+  const rows: ClarityRow[] = [];
+  let offset = 0;
+  while (rows.length < SNAPSHOT_ROW_CAP) {
+    const end = offset + SENSOR_RANGE_PAGE_SIZE - 1;
+    const { data, error } = await supabase
+      .from('clarity')
+      .select(SENSOR_COLUMNS)
+      .eq('time', recordedTime)
+      .order('sensor_index', { ascending: true })
+      .range(offset, end);
+    if (error) {
+      return { data: null, error: mapError(error) };
+    }
+    const batch = (data ?? []) as ClarityRow[];
+    if (batch.length === 0) break;
+    for (const r of batch) {
+      rows.push(r);
+      if (rows.length >= SNAPSHOT_ROW_CAP) break;
+    }
+    if (rows.length >= SNAPSHOT_ROW_CAP) break;
+    offset += batch.length;
+    if (batch.length < SENSOR_RANGE_PAGE_SIZE) break;
+  }
+  return { data: rows, error: null };
+}
+
 /**
  * All PurpleAir + Clarity rows for the same pipeline `time`.
  * Use when you already know the run timestamp (e.g. from a previous call or UI).
@@ -120,8 +266,8 @@ export async function fetchSensorReadingsAtRecordedTime(recordedTime: string): P
   error: FetchError | null;
 }> {
   const [purple, clarity] = await Promise.all([
-    fetchPurpleAirReadings({ atRecordedTime: recordedTime }),
-    fetchClarityReadings({ atRecordedTime: recordedTime }),
+    fetchPurpleAirAtRecordedTimePaginated(recordedTime),
+    fetchClarityAtRecordedTimePaginated(recordedTime),
   ]);
   const err = purple.error ?? clarity.error;
   return {
@@ -144,16 +290,8 @@ export async function fetchSensorReadingsBetweenRecordedTimes(
   error: FetchError | null;
 }> {
   const [purple, clarity] = await Promise.all([
-    fetchPurpleAirReadings({
-      fromRecordedTime,
-      toRecordedTime,
-      limit: SNAPSHOT_ROW_CAP,
-    }),
-    fetchClarityReadings({
-      fromRecordedTime,
-      toRecordedTime,
-      limit: SNAPSHOT_ROW_CAP,
-    }),
+    fetchPurpleAirReadingsBetweenPaginated(fromRecordedTime, toRecordedTime),
+    fetchClarityReadingsBetweenPaginated(fromRecordedTime, toRecordedTime),
   ]);
   const err = purple.error ?? clarity.error;
   return {
@@ -170,18 +308,33 @@ export async function fetchDailySensorAqiBetweenRecordedTimes(
   data: DailySensorAqiRow[] | null;
   error: FetchError | null;
 }> {
-  const { data, error } = await supabase
-    .from('daily_sensor_aqi')
-    .select(DAILY_SENSOR_AQI_COLUMNS)
-    .gte('time', fromRecordedTime)
-    .lte('time', toRecordedTime)
-    .order('time', { ascending: true })
-    .limit(SNAPSHOT_ROW_CAP);
-
-  if (error) {
-    return { data: null, error: mapError(error) };
+  const rows: DailySensorAqiRow[] = [];
+  let offset = 0;
+  while (rows.length < SENSOR_RANGE_HARD_MAX) {
+    const end = offset + SENSOR_RANGE_PAGE_SIZE - 1;
+    const { data, error } = await supabase
+      .from('daily_sensor_aqi')
+      .select(DAILY_SENSOR_AQI_COLUMNS)
+      .gte('time', fromRecordedTime)
+      .lte('time', toRecordedTime)
+      .order('time', { ascending: true })
+      .order('sensor_index', { ascending: true })
+      .order('source', { ascending: true })
+      .range(offset, end);
+    if (error) {
+      return { data: null, error: mapError(error) };
+    }
+    const batch = (data ?? []) as DailySensorAqiRow[];
+    if (batch.length === 0) break;
+    for (const r of batch) {
+      rows.push(r);
+      if (rows.length >= SENSOR_RANGE_HARD_MAX) break;
+    }
+    if (rows.length >= SENSOR_RANGE_HARD_MAX) break;
+    offset += batch.length;
+    if (batch.length < SENSOR_RANGE_PAGE_SIZE) break;
   }
-  return { data: (data ?? []) as DailySensorAqiRow[], error: null };
+  return { data: rows, error: null };
 }
 
 export async function fetchDailySensorAqiAtRecordedTime(
@@ -190,16 +343,31 @@ export async function fetchDailySensorAqiAtRecordedTime(
   data: DailySensorAqiRow[] | null;
   error: FetchError | null;
 }> {
-  const { data, error } = await supabase
-    .from('daily_sensor_aqi')
-    .select(DAILY_SENSOR_AQI_COLUMNS)
-    .eq('time', recordedTime)
-    .order('sensor_index', { ascending: true })
-    .limit(SNAPSHOT_ROW_CAP);
-  if (error) {
-    return { data: null, error: mapError(error) };
+  const rows: DailySensorAqiRow[] = [];
+  let offset = 0;
+  while (rows.length < SNAPSHOT_ROW_CAP) {
+    const end = offset + SENSOR_RANGE_PAGE_SIZE - 1;
+    const { data, error } = await supabase
+      .from('daily_sensor_aqi')
+      .select(DAILY_SENSOR_AQI_COLUMNS)
+      .eq('time', recordedTime)
+      .order('sensor_index', { ascending: true })
+      .order('source', { ascending: true })
+      .range(offset, end);
+    if (error) {
+      return { data: null, error: mapError(error) };
+    }
+    const batch = (data ?? []) as DailySensorAqiRow[];
+    if (batch.length === 0) break;
+    for (const r of batch) {
+      rows.push(r);
+      if (rows.length >= SNAPSHOT_ROW_CAP) break;
+    }
+    if (rows.length >= SNAPSHOT_ROW_CAP) break;
+    offset += batch.length;
+    if (batch.length < SENSOR_RANGE_PAGE_SIZE) break;
   }
-  return { data: (data ?? []) as DailySensorAqiRow[], error: null };
+  return { data: rows, error: null };
 }
 
 export async function fetchDailySensorAqiCalendarRows(): Promise<{
@@ -224,17 +392,33 @@ export async function fetchDailySensorAqiCalendarRowsForMonth(
   data: DailySensorAqiRow[] | null;
   error: FetchError | null;
 }> {
-  const { data, error } = await supabase
-    .from('daily_sensor_aqi')
-    .select('time,aqi,pm25')
-    .gte('time', fromRecordedTime)
-    .lte('time', toRecordedTime)
-    .order('time', { ascending: true })
-    .limit(50_000);
-  if (error) {
-    return { data: null, error: mapError(error) };
+  const rows: DailySensorAqiRow[] = [];
+  let offset = 0;
+  while (rows.length < SENSOR_RANGE_HARD_MAX) {
+    const end = offset + SENSOR_RANGE_PAGE_SIZE - 1;
+    const { data, error } = await supabase
+      .from('daily_sensor_aqi')
+      .select('time,aqi,pm25')
+      .gte('time', fromRecordedTime)
+      .lte('time', toRecordedTime)
+      .order('time', { ascending: true })
+      .order('sensor_index', { ascending: true })
+      .order('source', { ascending: true })
+      .range(offset, end);
+    if (error) {
+      return { data: null, error: mapError(error) };
+    }
+    const batch = (data ?? []) as DailySensorAqiRow[];
+    if (batch.length === 0) break;
+    for (const r of batch) {
+      rows.push(r);
+      if (rows.length >= SENSOR_RANGE_HARD_MAX) break;
+    }
+    if (rows.length >= SENSOR_RANGE_HARD_MAX) break;
+    offset += batch.length;
+    if (batch.length < SENSOR_RANGE_PAGE_SIZE) break;
   }
-  return { data: (data ?? []) as DailySensorAqiRow[], error: null };
+  return { data: rows, error: null };
 }
 
 export async function fetchKrigingGridAtRecordedTime(recordedTime: string): Promise<{
@@ -242,15 +426,16 @@ export async function fetchKrigingGridAtRecordedTime(recordedTime: string): Prom
   error: FetchError | null;
 }> {
   const rows: CurrentKrigingRow[] = [];
-  for (let page = 0; page < KRIGING_MAX_PAGES; page++) {
-    const offset = page * KRIGING_PAGE_SIZE;
+  let offset = 0;
+  while (rows.length < KRIGING_MAX_TOTAL_ROWS) {
+    const end = offset + KRIGING_RANGE_PAGE - 1;
     const { data, error } = await supabase
       .from('current_kriging')
       .select(KRIGING_COLUMNS)
       .eq('time', recordedTime)
       .order('latitude', { ascending: true })
       .order('longitude', { ascending: true })
-      .range(offset, offset + KRIGING_PAGE_SIZE - 1);
+      .range(offset, end);
     if (error) return { data: null, error: mapError(error) };
     const batch = ((data ?? []) as Array<Partial<CurrentKrigingRow>>).map((row) => ({
       latitude: row.latitude as number,
@@ -262,7 +447,8 @@ export async function fetchKrigingGridAtRecordedTime(recordedTime: string): Prom
     }));
     if (batch.length === 0) break;
     rows.push(...batch);
-    if (batch.length < KRIGING_PAGE_SIZE) break;
+    offset += batch.length;
+    if (batch.length < KRIGING_RANGE_PAGE) break;
   }
   return { data: rows, error: null };
 }
@@ -327,8 +513,8 @@ export async function fetchCurrentSensorReadings(): Promise<{
   }
 
   const [purple, clarity] = await Promise.all([
-    tPurple ? fetchPurpleAirReadings({ atRecordedTime: tPurple }) : Promise.resolve({ data: [] as PurpleAirRow[], error: null }),
-    tClarity ? fetchClarityReadings({ atRecordedTime: tClarity }) : Promise.resolve({ data: [] as ClarityRow[], error: null }),
+    tPurple ? fetchPurpleAirAtRecordedTimePaginated(tPurple) : Promise.resolve({ data: [] as PurpleAirRow[], error: null }),
+    tClarity ? fetchClarityAtRecordedTimePaginated(tClarity) : Promise.resolve({ data: [] as ClarityRow[], error: null }),
   ]);
 
   const err = purple.error ?? clarity.error;
@@ -346,15 +532,15 @@ export async function fetchCurrentKrigingGrid(): Promise<{
   error: FetchError | null;
 }> {
   const rows: CurrentKrigingRow[] = [];
-
-  for (let page = 0; page < KRIGING_MAX_PAGES; page++) {
-    const offset = page * KRIGING_PAGE_SIZE;
+  let offset = 0;
+  while (rows.length < KRIGING_MAX_TOTAL_ROWS) {
+    const end = offset + KRIGING_RANGE_PAGE - 1;
     const { data, error } = await supabase
       .from('current_kriging')
       .select(KRIGING_COLUMNS)
       .order('latitude', { ascending: true })
       .order('longitude', { ascending: true })
-      .range(offset, offset + KRIGING_PAGE_SIZE - 1);
+      .range(offset, end);
 
     if (error) {
       return { data: null, error: mapError(error) };
@@ -370,13 +556,47 @@ export async function fetchCurrentKrigingGrid(): Promise<{
     }));
     if (batch.length === 0) break;
     rows.push(...batch);
-    if (batch.length < KRIGING_PAGE_SIZE) break;
+    offset += batch.length;
+    if (batch.length < KRIGING_RANGE_PAGE) break;
   }
 
   return { data: rows, error: null };
 }
 
 const HOUR_MS = 60 * 60 * 1000;
+
+async function collectDistinctPipelineTimesFromTable(
+  table: 'purple_air' | 'clarity',
+  fromIso: string,
+  toIso: string,
+  into: Set<string>,
+): Promise<FetchError | null> {
+  let offset = 0;
+  let scanned = 0;
+  while (scanned < PIPELINE_TIME_SCAN_HARD_MAX) {
+    const end = offset + PIPELINE_TIME_PAGE_SIZE - 1;
+    const { data, error } = await supabase
+      .from(table)
+      .select('time,sensor_index')
+      .gte('time', fromIso)
+      .lte('time', toIso)
+      .order('time', { ascending: true })
+      .order('sensor_index', { ascending: true })
+      .range(offset, end);
+    if (error) {
+      return mapError(error);
+    }
+    const batch = (data ?? []) as { time: string }[];
+    if (batch.length === 0) break;
+    for (const row of batch) {
+      if (row?.time) into.add(row.time);
+    }
+    scanned += batch.length;
+    if (batch.length < PIPELINE_TIME_PAGE_SIZE) break;
+    offset += batch.length;
+  }
+  return null;
+}
 
 /**
  * Distinct pipeline `time` values in the window [now - hoursBack, now], from PurpleAir + Clarity.
@@ -386,21 +606,17 @@ export async function fetchDistinctPipelineTimes(hoursBack: number): Promise<{
   times: string[];
   error: FetchError | null;
 }> {
-  const from = new Date(Date.now() - hoursBack * HOUR_MS).toISOString();
-  const [p, c] = await Promise.all([
-    supabase.from('purple_air').select('time').gte('time', from).order('time', { ascending: true }).limit(50_000),
-    supabase.from('clarity').select('time').gte('time', from).order('time', { ascending: true }).limit(50_000),
-  ]);
-  const err = p.error ?? c.error;
-  if (err) {
-    return { times: [], error: mapError(err) };
-  }
+  const nowMs = Date.now();
+  const from = new Date(nowMs - hoursBack * HOUR_MS - ROLLING_24H_TIME_WINDOW_BUFFER_MS).toISOString();
+  const to = new Date(nowMs).toISOString();
   const set = new Set<string>();
-  for (const row of (p.data ?? []) as { time: string }[]) {
-    if (row?.time) set.add(row.time);
-  }
-  for (const row of (c.data ?? []) as { time: string }[]) {
-    if (row?.time) set.add(row.time);
+  const [e1, e2] = await Promise.all([
+    collectDistinctPipelineTimesFromTable('purple_air', from, to, set),
+    collectDistinctPipelineTimesFromTable('clarity', from, to, set),
+  ]);
+  const err = e1 ?? e2;
+  if (err) {
+    return { times: [], error: err };
   }
   const times = Array.from(set).sort((a, b) => new Date(a).getTime() - new Date(b).getTime());
   return { times, error: null };

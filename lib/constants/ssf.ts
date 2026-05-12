@@ -19,4 +19,7 @@ export const SSF_MAP_BOUNDARIES = {
 
 export const POLL_INTERVAL_MS = 30_000;
 
+/** Extra window on each end of rolling 24h queries so pipeline `time` and client clocks do not clip rows. */
+export const ROLLING_24H_TIME_WINDOW_BUFFER_MS = 15 * 60 * 1000;
+
 export const KM_TO_MI = 0.621371192237334;

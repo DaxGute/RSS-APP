@@ -3,6 +3,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Animated,
+  Easing,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -12,10 +15,13 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import type { CurrentKrigingRow } from '../lib/database.types';
-import type { DailySensorAqiRow } from '../lib/database.types';
+import type { ClarityRow, CurrentKrigingRow, DailySensorAqiRow, PurpleAirRow } from '../lib/database.types';
 import type { FetchError } from '../lib/fetchAirQuality';
-import { fetchDailySensorAqiCalendarRows, fetchDailySensorAqiCalendarRowsForMonth } from '../lib/fetchAirQuality';
+import {
+  fetchDailySensorAqiCalendarRows,
+  fetchDailySensorAqiCalendarRowsForMonth,
+  fetchSensorReadingsBetweenRecordedTimes,
+} from '../lib/fetchAirQuality';
 import { pm25ToAqi } from '../lib/aqiUtils';
 import { useAirQualityReminder } from '../hooks/useAirQualityReminder';
 import { regionFromSensorData } from '../lib/mapRegionFromData';
@@ -30,6 +36,24 @@ const BOTTOM_TAB_BAR_RESERVE = 6;
 const CALLOUT_WIDTH = 300;
 const CALLOUT_HEIGHT_ESTIMATE = 210;
 const CALLOUT_SCREEN_GUTTER = 12;
+const TEN_MIN_MS = 10 * 60 * 1000;
+/**
+ * Max |reading − slot| for a bucket to use that reading. One full 10‑minute step
+ * is needed so the earliest/latest rows in the window can still match the first
+ * and last grid slots (the grid start is aligned down, up to ~10 min before the
+ * first reading).
+ */
+const SLOT_READING_MATCH_MS = TEN_MIN_MS;
+
+const TIME_FILTER_MAIN_IN_MS = 200;
+const TIME_FILTER_SUB_IN_MS = 220;
+const TIME_FILTER_SUB_OUT_MS = 170;
+const TIME_FILTER_MAIN_OUT_MS = 190;
+const TIME_FILTER_MAIN_ENTER_OFFSET_Y = -10;
+/** Submenu sits left of Day/Month; slide in from the right (+x) and exit back that way. */
+const TIME_FILTER_SUB_SLIDE_OFFSET_X = 16;
+const TIME_FILTER_SUB_SWITCH_OUT_MS = 140;
+const TIME_FILTER_SUB_SWITCH_IN_MS = 190;
 
 function resolveRowAqi(row: DailySensorAqiRow): number | null {
   if (row.aqi != null && Number.isFinite(row.aqi)) return row.aqi;
@@ -61,6 +85,205 @@ function monthLabelToStartDate(label: string): Date {
   const monthIdx = MONTH_LABELS.findIndex((mm) => mm === m[1]);
   const y = 2000 + Number.parseInt(m[2], 10);
   return new Date(y, Math.max(0, monthIdx), 1);
+}
+
+function dayOffsetFromRelativeLabel(label: string): number | null {
+  if (label === 'Today') return 0;
+  if (label === 'Yesterday') return 1;
+  const m = label.match(/^(\d+) Days Ago$/i);
+  if (!m) return null;
+  const n = Number.parseInt(m[1], 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+function localDayBoundsForOffset(daysAgo: number): { startIso: string; endIso: string; dayKey: string } {
+  const start = new Date();
+  start.setDate(start.getDate() - daysAgo);
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(start);
+  end.setHours(23, 59, 59, 999);
+  return {
+    startIso: start.toISOString(),
+    endIso: end.toISOString(),
+    dayKey: dateKeyLocal(start),
+  };
+}
+
+function buildAverageAqiTimeseriesFromFeeds(
+  purpleAir: PurpleAirRow[] | null | undefined,
+  clarity: ClarityRow[] | null | undefined,
+): Array<{ time: string; avgAqi: number }> {
+  const sums = new Map<string, { total: number; count: number }>();
+  const addRow = (time: string | null | undefined, pm25: number | null | undefined) => {
+    if (!time || pm25 == null || !Number.isFinite(pm25)) return;
+    const aqi = pm25ToAqi(pm25);
+    if (aqi == null || !Number.isFinite(aqi)) return;
+    const curr = sums.get(time) ?? { total: 0, count: 0 };
+    curr.total += aqi;
+    curr.count += 1;
+    sums.set(time, curr);
+  };
+  for (const row of purpleAir ?? []) addRow(row.time, row.pm25);
+  for (const row of clarity ?? []) addRow(row.time, row.pm25);
+  return Array.from(sums.entries())
+    .map(([time, v]) => ({ time, avgAqi: v.count > 0 ? v.total / v.count : 0 }))
+    .filter((r) => Number.isFinite(new Date(r.time).getTime()))
+    .sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
+}
+
+function alignLocalMsDownToTenMin(ms: number): number {
+  const d = new Date(ms);
+  d.setSeconds(0, 0);
+  d.setMilliseconds(0);
+  const minutes = d.getMinutes();
+  d.setMinutes(minutes - (minutes % 10), 0, 0);
+  return d.getTime();
+}
+
+/**
+ * 10-minute slot ISOs for the rolling "Today" chart only.
+ * Uses a strict last-24h floor and `min(now, latest reading)` so we do not
+ * render empty buckets in the future or before the true 24h cutoff (fetch
+ * buffers must not widen the visible axis).
+ */
+function generateRolling24hTenMinuteSlotIsos(
+  averagePairs: Array<{ time: string; avgAqi: number }>,
+): string[] {
+  const nowMs = Date.now();
+  const strictStart = nowMs - 24 * 60 * 60 * 1000;
+  let t = alignLocalMsDownToTenMin(strictStart);
+
+  let maxDataMs = -Infinity;
+  for (const p of averagePairs) {
+    const x = new Date(p.time).getTime();
+    if (Number.isFinite(x)) maxDataMs = Math.max(maxDataMs, x);
+  }
+  const rawEnd = maxDataMs === -Infinity ? nowMs : maxDataMs;
+  const slotEndBound = Math.max(strictStart, Math.min(nowMs, rawEnd));
+  const lastSlotStart = alignLocalMsDownToTenMin(slotEndBound);
+  const lastAxisSlot = alignLocalMsDownToTenMin(nowMs);
+
+  const out: string[] = [];
+  while (t <= lastSlotStart && t <= lastAxisSlot) {
+    out.push(new Date(t).toISOString());
+    t += TEN_MIN_MS;
+  }
+  return out;
+}
+
+function generateLocalCalendarDayTenMinuteSlotIsos(dayKey: string): string[] {
+  const parts = dayKey.split('-').map((x) => Number.parseInt(x, 10));
+  if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) return [];
+  const [y, mo, da] = parts;
+  let t = new Date(y, mo - 1, da, 0, 0, 0, 0).getTime();
+  const last = new Date(y, mo - 1, da, 23, 59, 59, 999).getTime();
+  const out: string[] = [];
+  while (t <= last) {
+    out.push(new Date(t).toISOString());
+    t += TEN_MIN_MS;
+  }
+  return out;
+}
+
+function matchReadingToTenMinuteSlot(
+  slotIso: string,
+  pairs: Array<{ time: string; avgAqi: number }>,
+): { avgAqi: number; selectableTime: string | null } {
+  const slotMs = new Date(slotIso).getTime();
+  if (!Number.isFinite(slotMs)) return { avgAqi: 0, selectableTime: null };
+  let best: { time: string; avgAqi: number; dist: number } | null = null;
+  for (const p of pairs) {
+    const pm = new Date(p.time).getTime();
+    if (!Number.isFinite(pm)) continue;
+    const dist = Math.abs(pm - slotMs);
+    if (dist > SLOT_READING_MATCH_MS) continue;
+    if (!best || dist < best.dist || (dist === best.dist && p.time < best.time)) {
+      best = { time: p.time, avgAqi: p.avgAqi, dist };
+    }
+  }
+  if (best && Number.isFinite(best.avgAqi)) {
+    return { avgAqi: best.avgAqi, selectableTime: best.time };
+  }
+  return { avgAqi: 0, selectableTime: null };
+}
+
+function buildTimelineChartFromDenseSlots(
+  slotIsos: string[],
+  averagePairs: Array<{ time: string; avgAqi: number }>,
+  selectedTimeIsoForUi: string | null,
+): {
+  points: Array<{ time: string; avgAqi: number; position: number; selectableTime: string | null }>;
+  ticks: Array<{ position: number; label: string }>;
+  selectedPosition: number | null;
+} {
+  const sortedSlots = [...slotIsos]
+    .filter((iso) => Number.isFinite(new Date(iso).getTime()))
+    .sort((a, b) => new Date(a).getTime() - new Date(b).getTime());
+  const n = Math.max(1, sortedSlots.length);
+  const pts = sortedSlots.map((iso, i) => {
+    const { avgAqi, selectableTime } = matchReadingToTenMinuteSlot(iso, averagePairs);
+    return {
+      time: iso,
+      avgAqi: Number.isFinite(avgAqi) ? avgAqi : 0,
+      position: n <= 1 ? 0 : i / (n - 1),
+      selectableTime,
+    };
+  });
+  const hourTickTargets: Array<{ hour: number; label: string }> = [
+    { hour: 6, label: '6a' },
+    { hour: 0, label: '12a' },
+    { hour: 18, label: '6p' },
+    { hour: 12, label: '12p' },
+  ];
+  const ticks = hourTickTargets
+    .map(({ hour, label }) => {
+      if (sortedSlots.length === 0) return null;
+      let bestIdx = 0;
+      let bestDist = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < sortedSlots.length; i += 1) {
+        const d = new Date(sortedSlots[i]);
+        if (!Number.isFinite(d.getTime())) continue;
+        const dist = Math.abs(d.getHours() - hour);
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestIdx = i;
+        }
+      }
+      return {
+        idx: bestIdx,
+        position: n <= 1 ? 0 : bestIdx / (n - 1),
+        label,
+      };
+    })
+    .filter((tick): tick is { idx: number; position: number; label: string } => tick != null)
+    .sort((a, b) => a.position - b.position)
+    .filter((tick, idx, arr) => idx === 0 || tick.idx !== arr[idx - 1].idx)
+    .map(({ position, label }) => ({ position, label }));
+
+  let selectedIndex = -1;
+  if (selectedTimeIsoForUi && sortedSlots.length > 0) {
+    const selMs = new Date(selectedTimeIsoForUi).getTime();
+    if (Number.isFinite(selMs)) {
+      let bestI = 0;
+      let bestD = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < sortedSlots.length; i += 1) {
+        const d = Math.abs(new Date(sortedSlots[i]).getTime() - selMs);
+        if (d < bestD) {
+          bestD = d;
+          bestI = i;
+        }
+      }
+      const exact = sortedSlots.findIndex((iso) => iso === selectedTimeIsoForUi);
+      selectedIndex = exact >= 0 ? exact : bestI;
+    }
+  }
+
+  return {
+    points: pts,
+    ticks,
+    selectedPosition:
+      sortedSlots.length <= 1 ? 0 : selectedIndex >= 0 ? selectedIndex / (sortedSlots.length - 1) : 1,
+  };
 }
 
 export type SsfAirQualityScreenProps = {
@@ -108,11 +331,38 @@ export function SsfAirQualityScreen({
   } | null>(null);
   const [calendarOpen, setCalendarOpen] = useState(false);
   const [timeFilterMenuOpen, setTimeFilterMenuOpen] = useState(false);
-  const [timeFilterMode, setTimeFilterMode] = useState<'Today' | 'Month'>('Today');
+  const [timeFilterMode, setTimeFilterMode] = useState<'Day' | 'Month'>('Day');
+  const [dayMenuOpen, setDayMenuOpen] = useState(false);
   const [monthMenuOpen, setMonthMenuOpen] = useState(false);
+  const [selectedDayLabel, setSelectedDayLabel] = useState('Today');
   const [selectedMonthLabel, setSelectedMonthLabel] = useState('This Month');
   const [calendarRows, setCalendarRows] = useState<DailySensorAqiRow[]>([]);
   const [monthRowsLoading, setMonthRowsLoading] = useState(false);
+  const [dayPastRowsLoading, setDayPastRowsLoading] = useState(false);
+  const [pastDayAverageAqiTimeseries, setPastDayAverageAqiTimeseries] = useState<Array<{ time: string; avgAqi: number }>>(
+    [],
+  );
+  // Tracks a scrub landing on a chart bucket with no underlying readings (its
+  // `selectableTime` is null). We keep the marker visible at that position and
+  // render a blank map + overlay without touching the live timeline state.
+  const [pendingNoDataBucketTime, setPendingNoDataBucketTime] = useState<string | null>(null);
+  const dayLoadGenRef = useRef(0);
+
+  const mainDropdownOpacity = useRef(new Animated.Value(0)).current;
+  const mainDropdownTranslateY = useRef(new Animated.Value(0)).current;
+  const subDropdownOpacity = useRef(new Animated.Value(0)).current;
+  const subDropdownTranslateX = useRef(new Animated.Value(0)).current;
+  const timeFilterRunningAnimRef = useRef<Animated.CompositeAnimation | null>(null);
+  const timeFilterCloseTokenRef = useRef(0);
+  const timeFilterSwitchTokenRef = useRef(0);
+  const dayMenuOpenRef = useRef(dayMenuOpen);
+  const monthMenuOpenRef = useRef(monthMenuOpen);
+  const timeFilterMenuOpenRef = useRef(timeFilterMenuOpen);
+  const closeTimeFilterMenuRef = useRef<(afterClose?: () => void) => void>(() => {});
+  dayMenuOpenRef.current = dayMenuOpen;
+  monthMenuOpenRef.current = monthMenuOpen;
+  timeFilterMenuOpenRef.current = timeFilterMenuOpen;
+  const prevTimeFilterMenuOpenRef = useRef(false);
 
   const mapRegion = useMemo(() => regionFromSensorData(sensors, kriging), [sensors, kriging]);
   const selectedTimeIsoForUi = useMemo(
@@ -135,29 +385,6 @@ export function SsfAirQualityScreen({
       })
       .sort((a, b) => new Date(a).getTime() - new Date(b).getTime());
   }, [timelineTimesAsc]);
-  const timelineTimesForUi = useMemo(() => {
-    if (!selectedTimeIsoForUi) return todayTimelineTimesAsc;
-    if (!isSelectedDateToday) return [selectedTimeIsoForUi];
-    return todayTimelineTimesAsc.length > 0 ? todayTimelineTimesAsc : [selectedTimeIsoForUi];
-  }, [isSelectedDateToday, selectedTimeIsoForUi, todayTimelineTimesAsc]);
-  const timelineIndexForUi = useMemo(
-    () => {
-      if (timelineTimesForUi.length === 0) return 0;
-      if (!selectedTimeIsoForUi) return Math.max(0, timelineTimesForUi.length - 1);
-      const indexInUi = timelineTimesForUi.findIndex((iso) => iso === selectedTimeIsoForUi);
-      if (indexInUi >= 0) return indexInUi;
-      return Math.max(0, timelineTimesForUi.length - 1);
-    },
-    [selectedTimeIsoForUi, timelineTimesForUi],
-  );
-  const todayAverageAqiTimeseries = useMemo(() => {
-    const selectedKey = selectedTimeIsoForUi ? dateKeyLocal(new Date(selectedTimeIsoForUi)) : dateKeyLocal(new Date());
-    return averageAqiTimeseries.filter((p) => {
-      const d = new Date(p.time);
-      if (!Number.isFinite(d.getTime())) return false;
-      return dateKeyLocal(d) === selectedKey;
-    });
-  }, [averageAqiTimeseries, selectedTimeIsoForUi]);
   const prevIsSelectedDateTodayRef = useRef(isSelectedDateToday);
 
   useEffect(() => {
@@ -205,6 +432,9 @@ export function SsfAirQualityScreen({
         sensorName?: string | null;
       },
     ) => {
+      if (timeFilterMenuOpenRef.current) {
+        closeTimeFilterMenuRef.current();
+      }
       const matchedSensor =
         detail.sensorIndex != null
           ? sensors.find(
@@ -230,6 +460,187 @@ export function SsfAirQualityScreen({
   const clearSelection = useCallback(() => {
     setSelected(null);
   }, []);
+
+  const playTimeFilterOpenAnimation = useCallback(() => {
+    timeFilterRunningAnimRef.current?.stop();
+    const hasSub = dayMenuOpenRef.current || monthMenuOpenRef.current;
+    const easingOut = Easing.out(Easing.cubic);
+
+    mainDropdownOpacity.setValue(0);
+    mainDropdownTranslateY.setValue(TIME_FILTER_MAIN_ENTER_OFFSET_Y);
+    if (hasSub) {
+      subDropdownOpacity.setValue(0);
+      subDropdownTranslateX.setValue(TIME_FILTER_SUB_SLIDE_OFFSET_X);
+    } else {
+      subDropdownOpacity.setValue(1);
+      subDropdownTranslateX.setValue(0);
+    }
+
+    const mainEnter = Animated.parallel([
+      Animated.timing(mainDropdownOpacity, {
+        toValue: 1,
+        duration: TIME_FILTER_MAIN_IN_MS,
+        easing: easingOut,
+        useNativeDriver: true,
+      }),
+      Animated.timing(mainDropdownTranslateY, {
+        toValue: 0,
+        duration: TIME_FILTER_MAIN_IN_MS,
+        easing: easingOut,
+        useNativeDriver: true,
+      }),
+    ]);
+
+    const composite: Animated.CompositeAnimation = hasSub
+      ? Animated.sequence([
+          mainEnter,
+          Animated.parallel([
+            Animated.timing(subDropdownOpacity, {
+              toValue: 1,
+              duration: TIME_FILTER_SUB_IN_MS,
+              easing: easingOut,
+              useNativeDriver: true,
+            }),
+            Animated.timing(subDropdownTranslateX, {
+              toValue: 0,
+              duration: TIME_FILTER_SUB_IN_MS,
+              easing: easingOut,
+              useNativeDriver: true,
+            }),
+          ]),
+        ])
+      : mainEnter;
+
+    timeFilterRunningAnimRef.current = composite;
+    composite.start(({ finished }) => {
+      if (timeFilterRunningAnimRef.current === composite) timeFilterRunningAnimRef.current = null;
+    });
+  }, [mainDropdownOpacity, mainDropdownTranslateY, subDropdownOpacity, subDropdownTranslateX]);
+
+  const closeTimeFilterMenu = useCallback(
+    (afterClose?: () => void) => {
+      timeFilterRunningAnimRef.current?.stop();
+      timeFilterSwitchTokenRef.current += 1;
+      const closeToken = (timeFilterCloseTokenRef.current += 1);
+      const hasSub = dayMenuOpenRef.current || monthMenuOpenRef.current;
+      const easingIn = Easing.in(Easing.cubic);
+
+      const subOut = Animated.parallel([
+        Animated.timing(subDropdownOpacity, {
+          toValue: 0,
+          duration: TIME_FILTER_SUB_OUT_MS,
+          easing: easingIn,
+          useNativeDriver: true,
+        }),
+        Animated.timing(subDropdownTranslateX, {
+          toValue: TIME_FILTER_SUB_SLIDE_OFFSET_X,
+          duration: TIME_FILTER_SUB_OUT_MS,
+          easing: easingIn,
+          useNativeDriver: true,
+        }),
+      ]);
+      const mainOut = Animated.parallel([
+        Animated.timing(mainDropdownOpacity, {
+          toValue: 0,
+          duration: TIME_FILTER_MAIN_OUT_MS,
+          easing: easingIn,
+          useNativeDriver: true,
+        }),
+        Animated.timing(mainDropdownTranslateY, {
+          toValue: TIME_FILTER_MAIN_ENTER_OFFSET_Y,
+          duration: TIME_FILTER_MAIN_OUT_MS,
+          easing: easingIn,
+          useNativeDriver: true,
+        }),
+      ]);
+
+      const closeAnim = hasSub ? Animated.sequence([subOut, mainOut]) : mainOut;
+      timeFilterRunningAnimRef.current = closeAnim;
+      closeAnim.start(({ finished }) => {
+        if (!finished || closeToken !== timeFilterCloseTokenRef.current) return;
+        if (timeFilterRunningAnimRef.current === closeAnim) timeFilterRunningAnimRef.current = null;
+        setTimeFilterMenuOpen(false);
+        setDayMenuOpen(false);
+        setMonthMenuOpen(false);
+        afterClose?.();
+      });
+    },
+    [mainDropdownOpacity, mainDropdownTranslateY, subDropdownOpacity, subDropdownTranslateX],
+  );
+  closeTimeFilterMenuRef.current = closeTimeFilterMenu;
+
+  const dismissTimeFilterIfOpen = useCallback(() => {
+    if (timeFilterMenuOpenRef.current) {
+      closeTimeFilterMenuRef.current();
+    }
+  }, []);
+
+  const switchInnerTimeFilterSubmenu = useCallback(
+    (apply: () => void) => {
+      timeFilterRunningAnimRef.current?.stop();
+      const switchToken = (timeFilterSwitchTokenRef.current += 1);
+      const easingIn = Easing.in(Easing.cubic);
+      const easingOut = Easing.out(Easing.cubic);
+
+      const subOut = Animated.parallel([
+        Animated.timing(subDropdownOpacity, {
+          toValue: 0,
+          duration: TIME_FILTER_SUB_SWITCH_OUT_MS,
+          easing: easingIn,
+          useNativeDriver: true,
+        }),
+        Animated.timing(subDropdownTranslateX, {
+          toValue: TIME_FILTER_SUB_SLIDE_OFFSET_X,
+          duration: TIME_FILTER_SUB_SWITCH_OUT_MS,
+          easing: easingIn,
+          useNativeDriver: true,
+        }),
+      ]);
+
+      subOut.start(({ finished }) => {
+        if (!finished || switchToken !== timeFilterSwitchTokenRef.current) return;
+        if (timeFilterRunningAnimRef.current === subOut) timeFilterRunningAnimRef.current = null;
+        const runSwapAndIn = () => {
+          if (switchToken !== timeFilterSwitchTokenRef.current) return;
+          apply();
+          subDropdownOpacity.setValue(0);
+          subDropdownTranslateX.setValue(TIME_FILTER_SUB_SLIDE_OFFSET_X);
+
+          const subIn = Animated.parallel([
+            Animated.timing(subDropdownOpacity, {
+              toValue: 1,
+              duration: TIME_FILTER_SUB_SWITCH_IN_MS,
+              easing: easingOut,
+              useNativeDriver: true,
+            }),
+            Animated.timing(subDropdownTranslateX, {
+              toValue: 0,
+              duration: TIME_FILTER_SUB_SWITCH_IN_MS,
+              easing: easingOut,
+              useNativeDriver: true,
+            }),
+          ]);
+          timeFilterRunningAnimRef.current = subIn;
+          subIn.start(({ finished: fin }) => {
+            if (!fin || switchToken !== timeFilterSwitchTokenRef.current) return;
+            if (timeFilterRunningAnimRef.current === subIn) timeFilterRunningAnimRef.current = null;
+          });
+        };
+        requestAnimationFrame(() => {
+          requestAnimationFrame(runSwapAndIn);
+        });
+      });
+      timeFilterRunningAnimRef.current = subOut;
+    },
+    [subDropdownOpacity, subDropdownTranslateX],
+  );
+
+  useEffect(() => {
+    if (timeFilterMenuOpen && !prevTimeFilterMenuOpenRef.current) {
+      playTimeFilterOpenAnimation();
+    }
+    prevTimeFilterMenuOpenRef.current = timeFilterMenuOpen;
+  }, [timeFilterMenuOpen, playTimeFilterOpenAnimation]);
 
   const selectedCalloutPlacement = useMemo<'above' | 'below'>(() => {
     if (!selected?.screenPointY) return 'above';
@@ -263,66 +674,23 @@ export function SsfAirQualityScreen({
     return out;
   }, []);
 
+  const dayOptions = useMemo(() => {
+    const out: string[] = ['Today', 'Yesterday'];
+    for (let i = 2; i <= 7; i += 1) out.push(`${i} Days Ago`);
+    return out;
+  }, []);
+
   const chartData = useMemo(() => {
-    if (timeFilterMode === 'Today') {
-      // Restore scrub behavior: one point per real timeline timestamp (rolling 24h).
-      const aqiByTime = new Map<string, number>();
-      for (const p of averageAqiTimeseries) {
-        if (Number.isFinite(p.avgAqi)) aqiByTime.set(p.time, p.avgAqi);
-      }
-      const sortedTimelineTimes = [...timelineTimesAsc]
-        .filter((iso) => Number.isFinite(new Date(iso).getTime()))
-        .sort((a, b) => new Date(a).getTime() - new Date(b).getTime());
-      const n = Math.max(1, sortedTimelineTimes.length);
-      const pts = sortedTimelineTimes.map((iso, i) => ({
-        time: iso,
-        avgAqi: aqiByTime.get(iso) ?? 0,
-        position: n <= 1 ? 0 : i / (n - 1),
-        selectableTime: iso,
-      }));
-      const hourTickTargets: Array<{ hour: number; label: string }> = [
-        { hour: 6, label: '6a' },
-        { hour: 0, label: '12a' },
-        { hour: 18, label: '6p' },
-        { hour: 12, label: '12p' },
-      ];
-      const ticks = hourTickTargets
-        .map(({ hour, label }) => {
-          if (sortedTimelineTimes.length === 0) return null;
-          let bestIdx = 0;
-          let bestDist = Number.POSITIVE_INFINITY;
-          for (let i = 0; i < sortedTimelineTimes.length; i += 1) {
-            const d = new Date(sortedTimelineTimes[i]);
-            if (!Number.isFinite(d.getTime())) continue;
-            const dist = Math.abs(d.getHours() - hour);
-            if (dist < bestDist) {
-              bestDist = dist;
-              bestIdx = i;
-            }
-          }
-          return {
-            idx: bestIdx,
-            position: n <= 1 ? 0 : bestIdx / (n - 1),
-            label,
-          };
-        })
-        .filter((tick): tick is { idx: number; position: number; label: string } => tick != null)
-        .sort((a, b) => a.position - b.position)
-        .filter((tick, idx, arr) => idx === 0 || tick.idx !== arr[idx - 1].idx)
-        .map(({ position, label }) => ({ position, label }));
-      const selectedIndex = selectedTimeIsoForUi
-        ? sortedTimelineTimes.findIndex((iso) => iso === selectedTimeIsoForUi)
-        : -1;
-      return {
-        points: pts,
-        ticks,
-        selectedPosition:
-          sortedTimelineTimes.length <= 1
-            ? 0
-            : selectedIndex >= 0
-              ? selectedIndex / (sortedTimelineTimes.length - 1)
-              : 1,
-      };
+    if (timeFilterMode === 'Day' && selectedDayLabel === 'Today') {
+      const slots = generateRolling24hTenMinuteSlotIsos(averageAqiTimeseries);
+      return buildTimelineChartFromDenseSlots(slots, averageAqiTimeseries, selectedTimeIsoForUi);
+    }
+
+    if (timeFilterMode === 'Day' && selectedDayLabel !== 'Today') {
+      const offset = dayOffsetFromRelativeLabel(selectedDayLabel);
+      const slots =
+        offset == null ? [] : generateLocalCalendarDayTenMinuteSlotIsos(localDayBoundsForOffset(offset).dayKey);
+      return buildTimelineChartFromDenseSlots(slots, pastDayAverageAqiTimeseries, selectedTimeIsoForUi);
     }
 
     if (timeFilterMode === 'Month') {
@@ -448,37 +816,66 @@ export function SsfAirQualityScreen({
     return { points: [], ticks: [], selectedPosition: null };
   }, [
     calendarRows,
+    pastDayAverageAqiTimeseries,
+    averageAqiTimeseries,
+    selectedDayLabel,
     selectedMonthLabel,
     selectedTimeIsoForUi,
     timelineIndex,
     timelineTimesAsc,
     timeFilterMode,
-    averageAqiTimeseries,
-    todayAverageAqiTimeseries,
   ]);
 
   const timeFilterButtonLabel = useMemo(() => {
-    if (timeFilterMode === 'Today') return 'Today';
+    if (timeFilterMode === 'Day') return selectedDayLabel;
     return selectedMonthLabel;
-  }, [selectedMonthLabel, timeFilterMode]);
+  }, [selectedDayLabel, selectedMonthLabel, timeFilterMode]);
   const scrubMarkerLabel = useMemo(() => {
-    if (!selectedTimeIsoForUi) return null;
-    const selectedDate = new Date(selectedTimeIsoForUi);
+    // Prefer the no-data bucket while one is pinned so the marker reflects
+    // exactly where the user landed.
+    const iso = pendingNoDataBucketTime ?? selectedTimeIsoForUi;
+    if (!iso) return null;
+    const selectedDate = new Date(iso);
     if (!Number.isFinite(selectedDate.getTime())) return null;
-    if (timeFilterMode === 'Today') {
+    if (timeFilterMode === 'Day') {
       return selectedDate.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
     }
     return selectedDate.toLocaleDateString([], { month: 'short', day: 'numeric', year: '2-digit' });
-  }, [selectedTimeIsoForUi, timeFilterMode]);
+  }, [pendingNoDataBucketTime, selectedTimeIsoForUi, timeFilterMode]);
+
+  const effectiveSelectedPosition = useMemo(() => {
+    if (pendingNoDataBucketTime != null) {
+      const match = chartData.points.find((p) => p.time === pendingNoDataBucketTime);
+      if (match) return match.position;
+    }
+    return chartData.selectedPosition;
+  }, [chartData.points, chartData.selectedPosition, pendingNoDataBucketTime]);
+
+  const showInsufficientOverlay = pendingNoDataBucketTime != null || (!viewingLive && insufficientData);
+  const mapSensors = showInsufficientOverlay ? [] : sensors;
+  const mapKriging = showInsufficientOverlay ? [] : kriging;
+
+  // Drop any open sensor callout when entering an empty-map state, since the
+  // pin it referenced is no longer on screen.
+  useEffect(() => {
+    if (showInsufficientOverlay && selected != null) setSelected(null);
+  }, [selected, showInsufficientOverlay]);
 
   const lastAppliedSwitchKeyRef = useRef<string | null>(null);
   useEffect(() => {
-    const switchKey = `${timeFilterMode}:${timeFilterMode === 'Month' ? selectedMonthLabel : ''}`;
+    const switchKey = `${timeFilterMode}:${
+      timeFilterMode === 'Month' ? selectedMonthLabel : timeFilterMode === 'Day' ? selectedDayLabel : ''
+    }`;
     if (lastAppliedSwitchKeyRef.current === switchKey) return;
     lastAppliedSwitchKeyRef.current = switchKey;
+    // Switching filters invalidates any bucket the user had landed on.
+    setPendingNoDataBucketTime(null);
 
-    // Always reset to the top position when switching filter context.
-    if (timeFilterMode === 'Today') {
+    if (timeFilterMode === 'Day' && selectedDayLabel !== 'Today') {
+      return;
+    }
+
+    if (timeFilterMode === 'Day' && selectedDayLabel === 'Today') {
       if (timelineTimesAsc.length > 0) {
         const latestTimelineIso = [...timelineTimesAsc]
           .filter((iso) => Number.isFinite(new Date(iso).getTime()))
@@ -491,6 +888,7 @@ export function SsfAirQualityScreen({
       }
       return;
     }
+
     const topSelectableTime = [...chartData.points]
       .sort((a, b) => a.position - b.position)
       .find((p) => p.selectableTime)?.selectableTime;
@@ -499,6 +897,7 @@ export function SsfAirQualityScreen({
     chartData.points,
     onSelectRecordedTime,
     onTimelineIndexChange,
+    selectedDayLabel,
     selectedMonthLabel,
     timeFilterMode,
     timelineTimesAsc,
@@ -506,16 +905,40 @@ export function SsfAirQualityScreen({
 
   const applyScrubRecordedTime = useCallback(
     (recordedTime: string, { isCommit }: { isCommit: boolean }) => {
+      // TimeRangeModule emits a bucket `time` (with `selectableTime == null`)
+      // when the user scrubs onto a chart bucket that has no underlying
+      // readings. Detect that case so we can show a blank map + overlay rather
+      // than driving the live timeline.
+      const noDataBucket = chartData.points.find(
+        (p) => p.time === recordedTime && p.selectableTime == null,
+      );
+      if (noDataBucket) {
+        if (pendingNoDataBucketTime !== recordedTime) {
+          setPendingNoDataBucketTime(recordedTime);
+        }
+        return;
+      }
+
+      if (pendingNoDataBucketTime != null) setPendingNoDataBucketTime(null);
+
       const sourceIndex = timelineTimesAsc.findIndex((iso) => iso === recordedTime);
       if (sourceIndex >= 0) {
         if (sourceIndex !== timelineIndex) onTimelineIndexChange(sourceIndex);
         return;
       }
-      // Month buckets can point to historical timestamps outside the rolling
-      // timeline list; route through recorded-time selection so scrub loads data.
-      if (isCommit || timeFilterMode !== 'Today') onSelectRecordedTime(recordedTime);
+      const dayPastMode = timeFilterMode === 'Day' && selectedDayLabel !== 'Today';
+      if (isCommit || timeFilterMode === 'Month' || dayPastMode) onSelectRecordedTime(recordedTime);
     },
-    [onSelectRecordedTime, onTimelineIndexChange, timeFilterMode, timelineIndex, timelineTimesAsc],
+    [
+      chartData.points,
+      onSelectRecordedTime,
+      onTimelineIndexChange,
+      pendingNoDataBucketTime,
+      selectedDayLabel,
+      timeFilterMode,
+      timelineIndex,
+      timelineTimesAsc,
+    ],
   );
 
   return (
@@ -524,8 +947,8 @@ export function SsfAirQualityScreen({
         <View style={styles.main}>
           <View style={styles.mapCol}>
             <SsfMap
-              sensors={sensors}
-              kriging={kriging}
+              sensors={mapSensors}
+              kriging={mapKriging}
               mapRegion={mapRegion}
               selected={selected ? { latitude: selected.lat, longitude: selected.lon } : null}
               selectedCalloutPlacement={selectedCalloutPlacement}
@@ -591,9 +1014,15 @@ export function SsfAirQualityScreen({
               }
               onSelectCoordinate={onSelectCoordinate}
             />
-            {!viewingLive && insufficientData ? (
+            {showInsufficientOverlay ? (
               <View style={styles.insufficientWrap} pointerEvents="none">
-                <Text style={styles.insufficientText}>Insufficient Data</Text>
+                <View style={styles.insufficientCard}>
+                  <View style={styles.insufficientIconWrap}>
+                    <Ionicons name="cloud-offline-outline" size={22} color="#475569" />
+                  </View>
+                  <Text style={styles.insufficientTitle}>Insufficient Data</Text>
+                  <Text style={styles.insufficientSubtitle}>No sensor readings for this time.</Text>
+                </View>
               </View>
             ) : null}
           </View>
@@ -607,18 +1036,26 @@ export function SsfAirQualityScreen({
               },
             ]}
           >
-            {timelineLoading ? (
+            {timelineLoading || monthRowsLoading || dayPastRowsLoading ? (
               <ActivityIndicator size="small" color="#475569" style={styles.calendarSpinner} />
             ) : null}
             <Pressable
               onPress={() => {
                 const nextOpen = !timeFilterMenuOpen;
-                setTimeFilterMenuOpen(nextOpen);
                 if (nextOpen) {
-                  if (timeFilterMode === 'Month') setMonthMenuOpen(true);
-                  else setMonthMenuOpen(false);
+                  setTimeFilterMenuOpen(true);
+                  if (timeFilterMode === 'Month') {
+                    setMonthMenuOpen(true);
+                    setDayMenuOpen(false);
+                  } else if (timeFilterMode === 'Day') {
+                    setDayMenuOpen(true);
+                    setMonthMenuOpen(false);
+                  } else {
+                    setMonthMenuOpen(false);
+                    setDayMenuOpen(false);
+                  }
                 } else {
-                  setMonthMenuOpen(false);
+                  closeTimeFilterMenu();
                 }
               }}
               style={({ pressed }) => [styles.calendarButton, pressed && styles.calendarButtonPressed]}
@@ -632,28 +1069,53 @@ export function SsfAirQualityScreen({
               <Ionicons name={timeFilterMenuOpen ? 'chevron-up' : 'chevron-down'} size={16} color="#334155" />
             </Pressable>
             {timeFilterMenuOpen ? (
-              <View style={styles.mainDropdown}>
-                {(['Today', 'Month'] as const).map((option) => (
+              <Animated.View
+                style={[
+                  styles.mainDropdown,
+                  {
+                    opacity: mainDropdownOpacity,
+                    transform: [{ translateY: mainDropdownTranslateY }],
+                  },
+                ]}
+              >
+                {(['Day', 'Month'] as const).map((option) => (
                   <Pressable
                     key={option}
                     onPress={() => {
-                      setTimeFilterMode(option);
-                      if (option === 'Today') {
-                        setMonthMenuOpen(false);
-                        if (timelineTimesAsc.length > 0) {
-                          const latestTimelineIso = [...timelineTimesAsc]
-                            .filter((iso) => Number.isFinite(new Date(iso).getTime()))
-                            .sort((a, b) => new Date(a).getTime() - new Date(b).getTime())
-                            .at(-1);
-                          if (latestTimelineIso) {
-                            const latestSourceIndex = timelineTimesAsc.findIndex((iso) => iso === latestTimelineIso);
-                            if (latestSourceIndex >= 0) onTimelineIndexChange(latestSourceIndex);
-                          }
+                      if (option === 'Day') {
+                        if (timeFilterMode === 'Day' && dayMenuOpen) return;
+                        if (timeFilterMenuOpen && timeFilterMode === 'Month' && monthMenuOpen) {
+                          switchInnerTimeFilterSubmenu(() => {
+                            setTimeFilterMode('Day');
+                            setMonthMenuOpen(false);
+                            setDayMenuOpen(true);
+                            setSelectedDayLabel('Today');
+                            setPastDayAverageAqiTimeseries([]);
+                          });
+                          return;
                         }
-                        setTimeFilterMenuOpen(false);
+                        setTimeFilterMode('Day');
+                        setMonthMenuOpen(false);
+                        setDayMenuOpen(true);
+                        setTimeFilterMenuOpen(true);
+                        if (timeFilterMode === 'Month') {
+                          setSelectedDayLabel('Today');
+                          setPastDayAverageAqiTimeseries([]);
+                        }
                         return;
                       }
                       if (option === 'Month') {
+                        if (timeFilterMode === 'Month' && monthMenuOpen) return;
+                        if (timeFilterMenuOpen && timeFilterMode === 'Day' && dayMenuOpen) {
+                          switchInnerTimeFilterSubmenu(() => {
+                            setTimeFilterMode('Month');
+                            setDayMenuOpen(false);
+                            setMonthMenuOpen(true);
+                          });
+                          return;
+                        }
+                        setTimeFilterMode('Month');
+                        setDayMenuOpen(false);
                         setMonthMenuOpen(true);
                         setTimeFilterMenuOpen(true);
                         return;
@@ -666,62 +1128,164 @@ export function SsfAirQualityScreen({
                     ]}
                   >
                     <Text style={styles.dropdownItemText}>{option}</Text>
-                    {option === 'Month' ? (
+                    {option === 'Day' || option === 'Month' ? (
                       <Ionicons name="chevron-back" size={14} color="#475569" />
                     ) : null}
                   </Pressable>
                 ))}
-              </View>
+              </Animated.View>
             ) : null}
-            {monthMenuOpen ? (
-              <View style={styles.subDropdownLeft}>
-                <ScrollView
-                  style={styles.subDropdownScroll}
-                  contentContainerStyle={styles.subDropdownScrollContent}
-                  showsVerticalScrollIndicator
-                  nestedScrollEnabled
-                >
-                  {monthOptions.map((month) => (
-                    <Pressable
-                      key={`month-${month}`}
-                      onPress={() => {
-                        void (async () => {
-                          setSelectedMonthLabel(month);
-                          setMonthMenuOpen(false);
-                          setTimeFilterMenuOpen(false);
-                          setMonthRowsLoading(true);
-                          const monthStart = monthLabelToStartDate(month);
-                          const monthEnd = new Date(
-                            monthStart.getFullYear(),
-                            monthStart.getMonth() + 1,
-                            0,
-                            23,
-                            59,
-                            59,
-                            999,
-                          );
-                          const res =
-                            month === 'This Month'
-                              ? await fetchDailySensorAqiCalendarRows()
-                              : await fetchDailySensorAqiCalendarRowsForMonth(
-                                  monthStart.toISOString(),
-                                  monthEnd.toISOString(),
-                                );
-                          if (!res.error && res.data) setCalendarRows(res.data);
-                          setMonthRowsLoading(false);
-                        })();
-                      }}
-                      style={({ pressed }) => [
-                        styles.dropdownItem,
-                        selectedMonthLabel === month && styles.dropdownItemSelected,
-                        pressed && styles.dropdownItemPressed,
-                      ]}
+            {dayMenuOpen || monthMenuOpen ? (
+              <Animated.View
+                collapsable={false}
+                needsOffscreenAlphaCompositing={Platform.OS === 'ios'}
+                style={[
+                  styles.subDropdownLeft,
+                  {
+                    opacity: subDropdownOpacity,
+                    transform: [{ translateX: subDropdownTranslateX }],
+                  },
+                ]}
+              >
+                <View style={styles.subDropdownInnerStack}>
+                  <View
+                    collapsable={false}
+                    pointerEvents={dayMenuOpen ? 'auto' : 'none'}
+                    style={[
+                      styles.subDropdownLayerBase,
+                      dayMenuOpen ? styles.subDropdownLayerActive : styles.subDropdownLayerInactive,
+                    ]}
+                  >
+                    <ScrollView
+                      style={styles.subDropdownScroll}
+                      contentContainerStyle={styles.subDropdownScrollContent}
+                      showsVerticalScrollIndicator
+                      nestedScrollEnabled
+                      removeClippedSubviews={false}
                     >
-                      <Text style={styles.dropdownItemText}>{month}</Text>
-                    </Pressable>
-                  ))}
-                </ScrollView>
-              </View>
+                      {dayOptions.map((day) => (
+                        <Pressable
+                          key={`day-${day}`}
+                          onPress={() => {
+                            const picked = day;
+                            closeTimeFilterMenu(() => {
+                              void (async () => {
+                                setSelectedDayLabel(picked);
+                                if (picked === 'Today') {
+                                  dayLoadGenRef.current += 1;
+                                  setPastDayAverageAqiTimeseries([]);
+                                  setDayPastRowsLoading(false);
+                                  if (timelineTimesAsc.length > 0) {
+                                    const latestTimelineIso = [...timelineTimesAsc]
+                                      .filter((iso) => Number.isFinite(new Date(iso).getTime()))
+                                      .sort((a, b) => new Date(a).getTime() - new Date(b).getTime())
+                                      .at(-1);
+                                    if (latestTimelineIso) {
+                                      const latestSourceIndex = timelineTimesAsc.findIndex(
+                                        (iso) => iso === latestTimelineIso,
+                                      );
+                                      if (latestSourceIndex >= 0) onTimelineIndexChange(latestSourceIndex);
+                                    }
+                                  }
+                                  return;
+                                }
+                                const offset = dayOffsetFromRelativeLabel(picked);
+                                if (offset == null) return;
+                                const gen = (dayLoadGenRef.current += 1);
+                                setDayPastRowsLoading(true);
+                                try {
+                                  const { startIso, endIso, dayKey } = localDayBoundsForOffset(offset);
+                                  const res = await fetchSensorReadingsBetweenRecordedTimes(startIso, endIso);
+                                  if (gen !== dayLoadGenRef.current) return;
+                                  if (res.error) {
+                                    setPastDayAverageAqiTimeseries([]);
+                                    return;
+                                  }
+                                  const seriesAll = buildAverageAqiTimeseriesFromFeeds(res.purpleAir, res.clarity);
+                                  const series = seriesAll.filter((p) => dateKeyLocal(new Date(p.time)) === dayKey);
+                                  const timesAsc = series
+                                    .map((p) => p.time)
+                                    .filter((t) => Number.isFinite(new Date(t).getTime()))
+                                    .sort((a, b) => new Date(a).getTime() - new Date(b).getTime());
+                                  setPastDayAverageAqiTimeseries(series);
+                                  const latest = timesAsc.at(-1);
+                                  if (latest) onSelectRecordedTime(latest);
+                                } finally {
+                                  if (gen === dayLoadGenRef.current) setDayPastRowsLoading(false);
+                                }
+                              })();
+                            });
+                          }}
+                          style={({ pressed }) => [
+                            styles.dropdownItem,
+                            selectedDayLabel === day && styles.dropdownItemSelected,
+                            pressed && styles.dropdownItemPressed,
+                          ]}
+                        >
+                          <Text style={styles.dropdownItemText}>{day}</Text>
+                        </Pressable>
+                      ))}
+                    </ScrollView>
+                  </View>
+                  <View
+                    collapsable={false}
+                    pointerEvents={monthMenuOpen ? 'auto' : 'none'}
+                    style={[
+                      styles.subDropdownLayerBase,
+                      monthMenuOpen ? styles.subDropdownLayerActive : styles.subDropdownLayerInactive,
+                    ]}
+                  >
+                    <ScrollView
+                      style={styles.subDropdownScroll}
+                      contentContainerStyle={styles.subDropdownScrollContent}
+                      showsVerticalScrollIndicator
+                      nestedScrollEnabled
+                      removeClippedSubviews={false}
+                    >
+                      {monthOptions.map((month) => (
+                        <Pressable
+                          key={`month-${month}`}
+                          onPress={() => {
+                            const picked = month;
+                            closeTimeFilterMenu(() => {
+                              void (async () => {
+                                setSelectedMonthLabel(picked);
+                                setMonthRowsLoading(true);
+                                const monthStart = monthLabelToStartDate(picked);
+                                const monthEnd = new Date(
+                                  monthStart.getFullYear(),
+                                  monthStart.getMonth() + 1,
+                                  0,
+                                  23,
+                                  59,
+                                  59,
+                                  999,
+                                );
+                                const res =
+                                  picked === 'This Month'
+                                    ? await fetchDailySensorAqiCalendarRows()
+                                    : await fetchDailySensorAqiCalendarRowsForMonth(
+                                        monthStart.toISOString(),
+                                        monthEnd.toISOString(),
+                                      );
+                                if (!res.error && res.data) setCalendarRows(res.data);
+                                setMonthRowsLoading(false);
+                              })();
+                            });
+                          }}
+                          style={({ pressed }) => [
+                            styles.dropdownItem,
+                            selectedMonthLabel === month && styles.dropdownItemSelected,
+                            pressed && styles.dropdownItemPressed,
+                          ]}
+                        >
+                          <Text style={styles.dropdownItemText}>{month}</Text>
+                        </Pressable>
+                      ))}
+                    </ScrollView>
+                  </View>
+                </View>
+              </Animated.View>
             ) : null}
           </View>
 
@@ -737,19 +1301,22 @@ export function SsfAirQualityScreen({
             pointerEvents="auto"
           >
             <TimeRangeModule
-              key={`${timeFilterMode}:${selectedMonthLabel}`}
+              key={`${timeFilterMode}:${selectedMonthLabel}:${selectedDayLabel}`}
               points={chartData.points}
               active
-              loading={timelineLoading || monthRowsLoading}
-              selectedPosition={chartData.selectedPosition}
+              loading={timelineLoading || monthRowsLoading || dayPastRowsLoading}
+              selectedPosition={effectiveSelectedPosition}
               ticks={chartData.ticks}
               markerLabel={scrubMarkerLabel}
+              onScrubBegin={dismissTimeFilterIfOpen}
               topLabel={
                 timeFilterMode === 'Month'
                   ? selectedMonthLabel === 'This Month'
                     ? 'yesterday'
                     : null
-                  : 'now'
+                  : timeFilterMode === 'Day' && selectedDayLabel === 'Today'
+                    ? 'now'
+                    : null
               }
               graphOnly
               onPreviewTime={(recordedTime) => {
@@ -844,6 +1411,7 @@ const styles = StyleSheet.create({
     top: 48,
     minWidth: 120,
     maxHeight: 220,
+    overflow: 'hidden',
     backgroundColor: 'rgba(255,255,255,0.98)',
     borderRadius: 12,
     borderWidth: 1,
@@ -854,6 +1422,27 @@ const styles = StyleSheet.create({
     shadowRadius: 8,
     shadowOffset: { width: 0, height: 3 },
     elevation: 6,
+  },
+  subDropdownInnerStack: {
+    position: 'relative',
+    width: '100%',
+    overflow: 'hidden',
+  },
+  subDropdownLayerBase: {
+    width: '100%',
+  },
+  subDropdownLayerActive: {
+    position: 'relative',
+    zIndex: 2,
+    opacity: 1,
+  },
+  subDropdownLayerInactive: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    top: 0,
+    zIndex: 0,
+    opacity: 0,
   },
   subDropdownScroll: {
     maxHeight: 220,
@@ -891,12 +1480,47 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     zIndex: 3,
   },
-  insufficientText: {
-    color: '#dc2626',
-    fontSize: 22,
+  insufficientCard: {
+    minWidth: 220,
+    maxWidth: 320,
+    paddingHorizontal: 22,
+    paddingTop: 18,
+    paddingBottom: 16,
+    alignItems: 'center',
+    borderRadius: 18,
+    backgroundColor: 'rgba(255,255,255,0.94)',
+    borderWidth: 1,
+    borderColor: 'rgba(148,163,184,0.45)',
+    shadowColor: '#0f172a',
+    shadowOpacity: 0.18,
+    shadowRadius: 18,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 8,
+  },
+  insufficientIconWrap: {
+    width: 40,
+    height: 40,
+    borderRadius: 999,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(226,232,240,0.85)',
+    borderWidth: 1,
+    borderColor: 'rgba(148,163,184,0.5)',
+    marginBottom: 8,
+  },
+  insufficientTitle: {
+    fontSize: 16,
     fontWeight: '800',
-    textShadowColor: 'rgba(255,255,255,0.95)',
-    textShadowRadius: 6,
-    textShadowOffset: { width: 0, height: 0 },
+    letterSpacing: 0.3,
+    color: '#0f172a',
+    textAlign: 'center',
+  },
+  insufficientSubtitle: {
+    marginTop: 4,
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#64748b',
+    textAlign: 'center',
+    letterSpacing: 0.15,
   },
 });

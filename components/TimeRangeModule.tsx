@@ -38,6 +38,8 @@ type TimeRangeModuleProps = {
   orientation?: 'horizontal' | 'vertical';
   topLabel?: string | null;
   markerLabel?: string | null;
+  /** Fires when the user begins a scrub gesture (e.g. to dismiss an overlay menu). */
+  onScrubBegin?: () => void;
 };
 
 const CHART_HEIGHT = 72;
@@ -84,6 +86,7 @@ export function TimeRangeModule({
   orientation = 'horizontal',
   topLabel = 'now',
   markerLabel = null,
+  onScrubBegin,
 }: TimeRangeModuleProps) {
   const [layoutW, setLayoutW] = useState(0);
   const [layoutH, setLayoutH] = useState(0);
@@ -188,6 +191,7 @@ export function TimeRangeModule({
         onStartShouldSetPanResponderCapture: () => active,
         onMoveShouldSetPanResponderCapture: () => active,
         onPanResponderGrant: (e) => {
+          onScrubBegin?.();
           const mainRaw = orientation === 'vertical' ? e.nativeEvent.locationY : e.nativeEvent.locationX;
           const main = clamp(
             mainRaw,
@@ -201,7 +205,8 @@ export function TimeRangeModule({
           dragXRef.current = main;
           setDragX(main);
           const nearest = nearestPointForMain(main);
-          const targetTime = nearest?.selectableTime ?? null;
+          // Fall back to the bucket's nominal `time` so no-data slots stay selectable.
+          const targetTime = nearest?.selectableTime ?? nearest?.time ?? null;
           if (targetTime && targetTime !== lastPreviewTimeRef.current) {
             lastPreviewTimeRef.current = targetTime;
             onPreviewTime?.(targetTime);
@@ -221,7 +226,7 @@ export function TimeRangeModule({
           dragXRef.current = main;
           setDragX(main);
           const nearest = nearestPointForMain(main);
-          const targetTime = nearest?.selectableTime ?? null;
+          const targetTime = nearest?.selectableTime ?? nearest?.time ?? null;
           if (targetTime && targetTime !== lastPreviewTimeRef.current) {
             lastPreviewTimeRef.current = targetTime;
             onPreviewTime?.(targetTime);
@@ -233,7 +238,7 @@ export function TimeRangeModule({
             return;
           }
           const nearest = nearestPointForMain(dragXRef.current);
-          const targetTime = nearest?.selectableTime ?? null;
+          const targetTime = nearest?.selectableTime ?? nearest?.time ?? null;
           if (targetTime) onCommitTime(targetTime);
           dragXRef.current = null;
           setDragX(null);
@@ -245,7 +250,7 @@ export function TimeRangeModule({
           lastPreviewTimeRef.current = null;
         },
       }),
-    [active, layoutH, layoutW, normalized.values, onCommitTime, onPreviewTime, orientation],
+    [active, layoutH, layoutW, normalized.values, onCommitTime, onPreviewTime, onScrubBegin, orientation],
   );
 
   const markerMain = dragX ?? (orientation === 'vertical' ? selectedPos?.y : selectedPos?.x);

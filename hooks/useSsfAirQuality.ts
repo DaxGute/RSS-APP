@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { POLL_INTERVAL_MS } from '../lib/constants/ssf';
+import { POLL_INTERVAL_MS, ROLLING_24H_TIME_WINDOW_BUFFER_MS } from '../lib/constants/ssf';
 import type { ClarityRow, CurrentKrigingRow, DailySensorAqiRow, PurpleAirRow } from '../lib/database.types';
 import { pm25ToAqi } from '../lib/aqiUtils';
 import {
@@ -19,6 +19,15 @@ export type { SensorPoint, SensorSource } from '../lib/sensorTypes';
 const TIMELINE_HOURS_BACK = 24;
 const HISTORICAL_KRIGING_GRID_STEPS = 20;
 const HISTORICAL_KRIGING_NEIGHBORS = 4;
+
+function rollingRecordedTimeBounds(): { fromIso: string; toIso: string } {
+  const nowMs = Date.now();
+  const buf = ROLLING_24H_TIME_WINDOW_BUFFER_MS;
+  return {
+    fromIso: new Date(nowMs - TIMELINE_HOURS_BACK * 60 * 60 * 1000 - buf).toISOString(),
+    toIso: new Date(nowMs + buf).toISOString(),
+  };
+}
 
 export type SsfAirQualityState = {
   purpleAir: PurpleAirRow[];
@@ -155,9 +164,10 @@ function buildAverageAqiTimeseries(
 function trimTimesToRollingDay(timesAsc: string[], preserveIso?: string | null): string[] {
   const now = Date.now();
   const floor = now - TIMELINE_HOURS_BACK * 60 * 60 * 1000;
+  const ceiling = now;
   const trimmed = timesAsc.filter((iso) => {
     const t = new Date(iso).getTime();
-    return Number.isFinite(t) && t >= floor && t <= now;
+    return Number.isFinite(t) && t >= floor && t <= ceiling;
   });
   if (preserveIso && timesAsc.includes(preserveIso) && !trimmed.includes(preserveIso)) {
     return mergeTimesAsc(trimmed, [preserveIso]);
@@ -226,9 +236,7 @@ export function useSsfAirQuality(): SsfAirQualityState & { refresh: () => Promis
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      const now = new Date();
-      const fromIso = new Date(now.getTime() - TIMELINE_HOURS_BACK * 60 * 60 * 1000).toISOString();
-      const toIso = now.toISOString();
+      const { fromIso, toIso } = rollingRecordedTimeBounds();
       const dayRes = await fetchDailySensorAqiBetweenRecordedTimes(fromIso, toIso);
       if (cancelled || !mounted.current || dayRes.error || !dayRes.data || dayRes.data.length === 0) return;
 
@@ -265,9 +273,7 @@ export function useSsfAirQuality(): SsfAirQualityState & { refresh: () => Promis
     setError(null);
     setInitialLoadProgress(0.05);
     try {
-      const now = new Date();
-      const fromIso = new Date(now.getTime() - TIMELINE_HOURS_BACK * 60 * 60 * 1000).toISOString();
-      const toIso = now.toISOString();
+      const { fromIso, toIso } = rollingRecordedTimeBounds();
       const sensorsRes = await fetchSensorReadingsBetweenRecordedTimes(fromIso, toIso);
       if (!mounted.current) return;
       setInitialLoadProgress(0.9);
@@ -384,10 +390,15 @@ export function useSsfAirQuality(): SsfAirQualityState & { refresh: () => Promis
       const dailySensors = toDailySensorPoints(dailyRes.data);
       const sensorRows = dailySensors.length > 0 ? dailySensors : toSensorPoints(sRes.purpleAir, sRes.clarity);
       const recomputed = recomputeHistoricalKriging(sensorRows, t);
-      const krigingRows = recomputed.length > 0 ? recomputed : latestKrigingRef.current;
       // A single sensor datapoint is enough to consider the timestamp usable.
       // Kriging may be missing for sparse historical slots, but the snapshot is still informative.
       const isInsufficient = sensorRows.length === 0;
+      // When the slot is insufficient, blank the heatmap too instead of bleeding live kriging through.
+      const krigingRows = isInsufficient
+        ? []
+        : recomputed.length > 0
+          ? recomputed
+          : latestKrigingRef.current;
       if (sRes.error) {
         setError((prev) => prev ?? sRes.error ?? null);
       }
@@ -397,7 +408,6 @@ export function useSsfAirQuality(): SsfAirQualityState & { refresh: () => Promis
         insufficientData: isInsufficient,
       };
       if (isInsufficient) {
-        // Keep rendering the date's sensor points when available, but show a center warning.
         setHistoricalDisplay(snapshot);
         setInsufficientData(true);
         setTimelineLoading(false);
