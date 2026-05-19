@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
 import Mapbox from '@rnmapbox/maps';
 import type { FeatureCollection, Point } from 'geojson';
 import { Animated, Pressable, StyleSheet, View } from 'react-native';
@@ -10,6 +19,7 @@ import { pm25BreakpointCategory, pm25ToAqi } from '../lib/aqiUtils';
 import type { MapRegion } from '../lib/mapRegionFromData';
 import type { SensorPoint } from '../lib/sensorTypes';
 import { KrigingHeatmapLayer } from './KrigingHeatmapLayer';
+import { MapScaleActions } from './MapScaleActions';
 
 export type MapSelectDetail = {
   touchInBottomBand: boolean;
@@ -31,7 +41,15 @@ export type SsfMapProps = {
   selectedCallout?: ReactNode;
   selectedCalloutPlacement?: 'above' | 'below';
   selectedCalloutShiftX?: number;
+  onNotificationPress?: () => void;
+  onModelingPress?: () => void;
 };
+
+export type SsfMapHandle = {
+  focusCoordinate: (lat: number, lon: number, zoomLevel?: number) => void;
+};
+
+const NOTIFICATION_FOCUS_ZOOM = 14;
 
 const mapboxToken = process.env.EXPO_PUBLIC_MAPBOX_TOKEN;
 if (mapboxToken) {
@@ -43,6 +61,7 @@ const MIN_ZOOM_FACTOR = 0.5;
 const MAX_ZOOM_FACTOR = 3;
 const MIN_ZOOM_LEVEL = DEFAULT_ZOOM_LEVEL * MIN_ZOOM_FACTOR;
 const MAX_ZOOM_LEVEL = DEFAULT_ZOOM_LEVEL * MAX_ZOOM_FACTOR;
+const ZOOM_STEP = 1;
 const REMINDER_BELL_PATH =
   'M42.2174 32.922V21.7756C42.2174 20.4935 42.0235 19.2188 41.6423 17.9946C37.9321 6.07937 21.0679 6.07937 17.3577 17.9946C16.9765 19.2188 16.7826 20.4935 16.7826 21.7756V32.922C16.7826 34.01 16.3743 35.0585 15.6383 35.8599L11.5394 40.3236C10.9506 40.9648 11.4054 42 12.2759 42H46.7241C47.5946 42 48.0494 40.9648 47.4606 40.3236L43.3617 35.8599C42.6257 35.0585 42.2174 34.01 42.2174 32.922Z';
 
@@ -61,19 +80,26 @@ function ReminderBellIcon() {
   );
 }
 
-export function SsfMap({
-  sensors,
-  kriging,
-  mapRegion,
-  selected,
-  reminderLocation = null,
-  onSelectCoordinate,
-  selectedCallout = null,
-  selectedCalloutPlacement = 'above',
-  selectedCalloutShiftX = 0,
-}: SsfMapProps) {
+export const SsfMap = forwardRef<SsfMapHandle, SsfMapProps>(function SsfMap(
+  {
+    sensors,
+    kriging,
+    mapRegion,
+    selected,
+    reminderLocation = null,
+    onSelectCoordinate,
+    selectedCallout = null,
+    selectedCalloutPlacement = 'above',
+    selectedCalloutShiftX = 0,
+    onNotificationPress,
+    onModelingPress,
+  },
+  ref,
+) {
   const wrapRef = useRef<View>(null);
+  const cameraRef = useRef<Mapbox.Camera>(null);
   const lastSensorTapMsRef = useRef(0);
+  const [zoomLevel, setZoomLevel] = useState(DEFAULT_ZOOM_LEVEL);
   const calloutScale = useRef(new Animated.Value(0.92)).current;
   const calloutOpacity = useRef(new Animated.Value(0)).current;
   const [animatedSelected, setAnimatedSelected] = useState(selected);
@@ -208,6 +234,50 @@ export function SsfMap({
     handlePress(reminderLocation.latitude, reminderLocation.longitude, null, null);
   }, [handlePress, reminderLocation]);
 
+  useImperativeHandle(
+    ref,
+    () => ({
+      focusCoordinate(lat: number, lon: number, zoom = NOTIFICATION_FOCUS_ZOOM) {
+        const clamped = Math.min(MAX_ZOOM_LEVEL, Math.max(MIN_ZOOM_LEVEL, zoom));
+        setZoomLevel(clamped);
+        cameraRef.current?.setCamera({
+          centerCoordinate: [lon, lat],
+          zoomLevel: clamped,
+          animationDuration: 700,
+          animationMode: 'flyTo',
+        });
+      },
+    }),
+    [],
+  );
+
+  const canZoomIn = zoomLevel < MAX_ZOOM_LEVEL - 0.05;
+  const canZoomOut = zoomLevel > MIN_ZOOM_LEVEL + 0.05;
+
+  const applyZoomDelta = useCallback(
+    (delta: number) => {
+      const next = Math.min(MAX_ZOOM_LEVEL, Math.max(MIN_ZOOM_LEVEL, zoomLevel + delta));
+      setZoomLevel(next);
+      cameraRef.current?.setCamera({
+        centerCoordinate: [mapRegion.longitude, mapRegion.latitude],
+        zoomLevel: next,
+        animationDuration: 200,
+        animationMode: 'easeTo',
+      });
+    },
+    [mapRegion.latitude, mapRegion.longitude, zoomLevel],
+  );
+
+  const zoomIn = useCallback(() => applyZoomDelta(ZOOM_STEP), [applyZoomDelta]);
+  const zoomOut = useCallback(() => applyZoomDelta(-ZOOM_STEP), [applyZoomDelta]);
+
+  const handleCameraChanged = useCallback((event: { properties?: { zoom?: number } }) => {
+    const z = event.properties?.zoom;
+    if (typeof z === 'number' && Number.isFinite(z)) {
+      setZoomLevel(z);
+    }
+  }, []);
+
   useEffect(() => {
     const selectedCoordKey = selected
       ? `${selected.latitude.toFixed(6)}:${selected.longitude.toFixed(6)}`
@@ -291,12 +361,18 @@ export function SsfMap({
         compassEnabled={false}
         logoEnabled={false}
         attributionEnabled={false}
+        scaleBarEnabled={false}
         rotateEnabled={false}
         pitchEnabled={false}
         onPress={handleMapPress}
+        onCameraChanged={handleCameraChanged}
       >
         <Mapbox.Camera
-          zoomLevel={DEFAULT_ZOOM_LEVEL}
+          ref={cameraRef}
+          defaultSettings={{
+            centerCoordinate: [mapRegion.longitude, mapRegion.latitude],
+            zoomLevel: DEFAULT_ZOOM_LEVEL,
+          }}
           centerCoordinate={[mapRegion.longitude, mapRegion.latitude]}
           maxBounds={{
             ne: [SSF_BBOX.seLon, SSF_BBOX.nwLat],
@@ -371,9 +447,17 @@ export function SsfMap({
           </Mapbox.PointAnnotation>
         ) : null}
       </Mapbox.MapView>
+      <MapScaleActions
+        onNotificationPress={onNotificationPress}
+        onModelingPress={onModelingPress}
+        onZoomIn={zoomIn}
+        onZoomOut={zoomOut}
+        canZoomIn={canZoomIn}
+        canZoomOut={canZoomOut}
+      />
     </View>
   );
-}
+});
 
 const styles = StyleSheet.create({
   wrap: { flex: 1, minHeight: 0, width: '100%', alignSelf: 'stretch', backgroundColor: '#dbeafe' },

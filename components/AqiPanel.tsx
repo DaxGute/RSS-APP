@@ -1,7 +1,7 @@
 import { FontAwesome } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import type { RefObject } from 'react';
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Linking,
   Modal,
@@ -354,6 +354,8 @@ export type AqiPanelProps = {
   savedReminderCategoryIndex?: number | null;
   /** Saved cooldown for the reminder (minutes); omit or null to use default 60 in the modal. */
   savedReminderCooldownMinutes?: number | null;
+  /** Increment from parent to open the reminder modal without duplicating modal UI. */
+  openReminderModalSignal?: number;
   /**
    * Health tooltip relative to the ? control. Use `above` when the panel sits at the bottom of the screen
    * so the popover stays visible; `below` when there is room under the chip (e.g. lifted center sheet).
@@ -379,6 +381,7 @@ export function AqiPanel({
   onReminderClear,
   savedReminderCategoryIndex = null,
   savedReminderCooldownMinutes = null,
+  openReminderModalSignal = 0,
   healthTooltipPlacement = 'below',
 }: AqiPanelProps) {
   const { width: winW, height: winH } = useWindowDimensions();
@@ -439,6 +442,15 @@ export function AqiPanel({
   const closeReminderModal = useCallback(() => {
     setReminderModalOpen(false);
   }, []);
+
+  const openReminderModalSignalRef = useRef(openReminderModalSignal);
+  useEffect(() => {
+    if (openReminderModalSignal === openReminderModalSignalRef.current) return;
+    openReminderModalSignalRef.current = openReminderModalSignal;
+    if (openReminderModalSignal <= 0) return;
+    if (!onReminderPickThreshold) return;
+    openReminderModal();
+  }, [openReminderModalSignal, onReminderPickThreshold, openReminderModal]);
 
   const compact = sheetMode;
 

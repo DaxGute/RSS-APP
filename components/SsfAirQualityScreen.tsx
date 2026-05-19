@@ -27,7 +27,7 @@ import { useAirQualityReminder } from '../hooks/useAirQualityReminder';
 import { regionFromSensorData } from '../lib/mapRegionFromData';
 import type { SensorPoint } from '../lib/sensorTypes';
 import { AqiPanel } from './AqiPanel';
-import { SsfMap } from './SsfMap';
+import { SsfMap, type SsfMapHandle } from './SsfMap';
 import { TimeRangeModule } from './TimeRangeModule';
 import { TimelineCalendarModal } from './TimelineCalendarModal';
 
@@ -347,6 +347,9 @@ export function SsfAirQualityScreen({
   // render a blank map + overlay without touching the live timeline state.
   const [pendingNoDataBucketTime, setPendingNoDataBucketTime] = useState<string | null>(null);
   const dayLoadGenRef = useRef(0);
+  const mapRef = useRef<SsfMapHandle>(null);
+  const [openReminderModalSignal, setOpenReminderModalSignal] = useState(0);
+  const pendingOpenReminderRef = useRef(false);
 
   const mainDropdownOpacity = useRef(new Animated.Value(0)).current;
   const mainDropdownTranslateY = useRef(new Animated.Value(0)).current;
@@ -460,6 +463,53 @@ export function SsfAirQualityScreen({
   const clearSelection = useCallback(() => {
     setSelected(null);
   }, []);
+
+  const openNotificationSettings = useCallback(() => {
+    setOpenReminderModalSignal((n) => n + 1);
+  }, []);
+
+  const requestOpenNotificationSettings = useCallback(() => {
+    pendingOpenReminderRef.current = true;
+    if (selected != null) {
+      openNotificationSettings();
+      pendingOpenReminderRef.current = false;
+    }
+  }, [openNotificationSettings, selected]);
+
+  const selectNotificationCoordinate = useCallback(
+    (lat: number, lon: number) => {
+      onSelectCoordinate(lat, lon, {
+        touchInBottomBand: false,
+        screenPointX: null,
+        screenPointY: null,
+      });
+    },
+    [onSelectCoordinate],
+  );
+
+  const focusNotificationLocation = useCallback(() => {
+    if (reminder == null) {
+      selectNotificationCoordinate(mapRegion.latitude, mapRegion.longitude);
+      requestOpenNotificationSettings();
+      return;
+    }
+
+    mapRef.current?.focusCoordinate(reminder.lat, reminder.lon);
+    selectNotificationCoordinate(reminder.lat, reminder.lon);
+    requestOpenNotificationSettings();
+  }, [
+    mapRegion.latitude,
+    mapRegion.longitude,
+    reminder,
+    requestOpenNotificationSettings,
+    selectNotificationCoordinate,
+  ]);
+
+  useEffect(() => {
+    if (!pendingOpenReminderRef.current || selected == null) return;
+    pendingOpenReminderRef.current = false;
+    openNotificationSettings();
+  }, [openNotificationSettings, selected]);
 
   const playTimeFilterOpenAnimation = useCallback(() => {
     timeFilterRunningAnimRef.current?.stop();
@@ -947,6 +997,7 @@ export function SsfAirQualityScreen({
         <View style={styles.main}>
           <View style={styles.mapCol}>
             <SsfMap
+              ref={mapRef}
               sensors={mapSensors}
               kriging={mapKriging}
               mapRegion={mapRegion}
@@ -1006,6 +1057,7 @@ export function SsfAirQualityScreen({
                     onReminderClear={clearReminder}
                     savedReminderCategoryIndex={reminder?.categoryIndex ?? null}
                     savedReminderCooldownMinutes={reminder?.cooldownMinutes ?? null}
+                    openReminderModalSignal={openReminderModalSignal}
                   />
                 ) : null
               }
@@ -1013,6 +1065,10 @@ export function SsfAirQualityScreen({
                 reminder ? { latitude: reminder.lat, longitude: reminder.lon } : null
               }
               onSelectCoordinate={onSelectCoordinate}
+              onNotificationPress={focusNotificationLocation}
+              onModelingPress={() => {
+                /* modeling entry point — placeholder */
+              }}
             />
             {showInsufficientOverlay ? (
               <View style={styles.insufficientWrap} pointerEvents="none">
