@@ -374,15 +374,28 @@ export async function fetchDailySensorAqiCalendarRows(): Promise<{
   data: DailySensorAqiRow[] | null;
   error: FetchError | null;
 }> {
-  const { data, error } = await supabase
-    .from('daily_sensor_aqi')
-    .select('time,aqi,pm25')
-    .order('time', { ascending: false })
-    .limit(50_000);
-  if (error) {
-    return { data: null, error: mapError(error) };
+  const rows: DailySensorAqiRow[] = [];
+  let offset = 0;
+  while (rows.length < SENSOR_RANGE_HARD_MAX) {
+    const end = offset + SENSOR_RANGE_PAGE_SIZE - 1;
+    const { data, error } = await supabase
+      .from('daily_sensor_aqi')
+      .select('time,aqi,pm25')
+      .order('time', { ascending: true })
+      .order('sensor_index', { ascending: true })
+      .order('source', { ascending: true })
+      .range(offset, end);
+    if (error) {
+      return { data: null, error: mapError(error) };
+    }
+    const batch = (data ?? []) as DailySensorAqiRow[];
+    if (batch.length === 0) break;
+    rows.push(...batch);
+    if (rows.length >= SENSOR_RANGE_HARD_MAX) break;
+    offset += batch.length;
+    if (batch.length < SENSOR_RANGE_PAGE_SIZE) break;
   }
-  return { data: ((data ?? []) as DailySensorAqiRow[]).reverse(), error: null };
+  return { data: rows, error: null };
 }
 
 export async function fetchDailySensorAqiCalendarRowsForMonth(
